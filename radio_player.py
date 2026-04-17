@@ -17,6 +17,7 @@ import queue
 import io
 import xml.etree.ElementTree as ET
 import wave
+import numpy as np
 from urllib.request import urlopen, Request
 from urllib.error import URLError
 
@@ -26,9 +27,17 @@ from urllib.error import URLError
 DEFAULT_AREA = "tokyo"
 ENABLE_STT = True           # False で STT を無効化（起動を速くする）
 WHISPER_MODEL = "medium"    # tiny/small/medium/large-v3   medium が精度と速度のバランス良い
-CHUNK_DURATION = 8          # 秒ごとキャプチャ → 認識（長いほど精度高いがメモリも消費）
+CHUNK_DURATION = 1.5        # 秒ごとキャプチャ（短くして実時間性を上げる）
+STT_WINDOW_SEC = 6          # 滑動窗口：最近 N 秒の音声を一括認識
 SAMPLE_RATE = 16000
 WHISPER_LANG = "ja"
+
+# ── TUI 字幕配色（curses color 番号）──
+# 黒背景で見やすい配色: 歴史行=白, 実時行=黄色太字
+STT_HIST_COLOR = "WHITE"        # 历史字幕前景色 (WHITE/GREEN/CYAN/YELLOW)
+STT_LIVE_COLOR = "YELLOW"       # 实时字幕前景色
+STT_HIST_BG    = "DEFAULT"      # 历史字幕背景色 (DEFAULT = 终端默认)
+STT_LIVE_BG    = "DEFAULT"      # 实时字幕背景色
 
 # ──────────────────────────────────────────────
 # 2.  STT — faster-whisper
@@ -61,12 +70,17 @@ class AudioSTT:
         self._model = None
         self._thread: threading.Thread | None = None
         self._running = False
-        self._audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=8)
+        self._audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=16)
         self._transcript_queue: queue.Queue[str] = queue.Queue(maxsize=3)
         # 直近の認識結果（滚动显示，扩大缓冲）
         self._recent: list[str] = []
+        self._current_partial: str = ""  # 当前正在识别的部分文本
         self._prebuf: list[bytes] = []   # model 加载期间暂存音频
         self._lock = threading.Lock()
+        # 滑动窗口音频缓冲（PCM s16le bytes 列表）
+        self._window_buf: list[bytes] = []
+        self._window_total_samples: int = 0
+        self._last_text: str = ""  # 上次识别全文，用于去重
         self._load_error: str | None = None
         self._loading = True        # モデル加载中フラグ
         self._loading_msg: str = f"Whisper モデル下载中 ({model_name})..."
@@ -180,14 +194,11 @@ class AudioSTT:
 
     # ── キューに音声を追加（mpv/ffplay から呼ばれる） ──
     def feed(self, pcm_chunk: bytes):
-        import sys as _sys
         if not self._running:
             return
         if self._model is not None:
             try:
                 self._audio_queue.put_nowait(pcm_chunk)
-                _sys.stderr.write(f"[feed] queued chunk={len(pcm_chunk)}\n")
-                _sys.stderr.flush()
             except queue.Full:
                 pass
         else:
@@ -202,59 +213,116 @@ class AudioSTT:
         if not self._model:
             return
 
-        # model 加载完成后，先处理 prebuf（缓冲期间积累的音频）
+        # model 加载完成后，先处理 prebuf
         while self._prebuf and self._running:
             raw = self._prebuf.pop(0)
-            self._transcribe_chunk(raw)
+            self._ingest_chunk(raw)
 
         while self._running:
             try:
                 raw = self._audio_queue.get(timeout=2.0)
             except queue.Empty:
                 continue
-            import sys as _sys
-            _sys.stderr.write(f"[worker] got chunk from queue, len={len(raw)}\n")
-            _sys.stderr.flush()
-            self._transcribe_chunk(raw)
+            self._ingest_chunk(raw)
 
-    def _transcribe_chunk(self, raw: bytes):
-        """对一个 WAV chunk 进行识别，结果写入 _recent。"""
-        import sys as _sys
-        _sys.stderr.write(f"[Whisper] transcribe_chunk called, raw_len={len(raw)}\n")
-        _sys.stderr.flush()
+    def _ingest_chunk(self, raw_wav: bytes):
+        """WAV chunk → PCM 追加到滑动窗口，触发识别。"""
+        if len(raw_wav) < 44:
+            return
         try:
-            pcm = self._wav_to_pcm(raw)
+            with io.BytesIO(raw_wav) as f:
+                with wave.open(f) as w:
+                    pcm = w.readframes(w.getnframes())
+            n_samples = len(pcm) // 2
+            self._window_buf.append(pcm)
+            self._window_total_samples += n_samples
+
+            # 窗口超过 STT_WINDOW_SEC 时裁剪旧数据
+            max_samples = int(STT_WINDOW_SEC * SAMPLE_RATE)
+            while self._window_total_samples > max_samples and len(self._window_buf) > 1:
+                removed = self._window_buf.pop(0)
+                self._window_total_samples -= len(removed) // 2
+
+            self._transcribe_window()
         except Exception:
+            pass
+
+    def _transcribe_window(self):
+        """用滑动窗口内的完整音频做识别。"""
+        if not self._window_buf:
             return
-        if len(pcm) < SAMPLE_RATE // 8:  # 0.125秒以下はスキップ
+        all_pcm = b"".join(self._window_buf)
+        if len(all_pcm) < SAMPLE_RATE * 2 // 4:  # < 0.25s skip
             return
+
+        int16_arr = np.frombuffer(all_pcm, dtype=np.int16)
+        audio = int16_arr.astype(np.float32) / 32768.0
+
         try:
             segments, info = self._model.transcribe(
-                io.BytesIO(pcm),
+                audio,
                 language=self.language,
-                beam_size=5,
+                beam_size=3,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=300, speech_pad_ms=200),
             )
             text_parts = []
             for seg in segments:
-                if seg.text.strip():
-                    text_parts.append(seg.text.strip())
+                t = seg.text.strip()
+                if t:
+                    text_parts.append(t)
+
             if text_parts:
-                text = " ".join(text_parts)
+                full_text = " ".join(text_parts)
+                if full_text != self._last_text:
+                    new_text = self._extract_new(self._last_text, full_text)
+                    self._last_text = full_text
+                    if new_text:
+                        with self._lock:
+                            self._current_partial = new_text
+                            self._recent.append(new_text)
+                            if len(self._recent) > 50:
+                                self._recent.pop(0)
+                        try:
+                            self._transcript_queue.put_nowait(new_text)
+                        except queue.Full:
+                            pass
                 with self._lock:
-                    self._recent.append(text)
-                    if len(self._recent) > 20:
-                        self._recent.pop(0)
-                try:
-                    self._transcript_queue.put_nowait(text)
-                except queue.Full:
-                    pass
+                    self._current_partial = text_parts[-1] if text_parts else ""
             else:
-                # 调试：空结果也打印（删掉这3行后性能恢复正常）
-                import sys as _sys
-                _sys.stderr.write(f"[Whisper] chunk={len(pcm)//(SAMPLE_RATE*2)}秒 空结果 lang={self.language}\n")
-                _sys.stderr.flush()
+                with self._lock:
+                    self._current_partial = ""
         except Exception:
             pass
+
+    @staticmethod
+    def _extract_new(old: str, new: str) -> str:
+        """从 new 中提取相对 old 的新增尾部。"""
+        if not old:
+            return new
+        old_chars = old.replace(" ", "")
+        new_chars = new.replace(" ", "")
+        best = 0
+        for i in range(1, len(old_chars) + 1):
+            if new_chars.startswith(old_chars[-i:]):
+                best = i
+        if best > 0:
+            suffix = old_chars[-best:]
+            pos = 0
+            matched = 0
+            for ch in new:
+                if ch == " ":
+                    pos += 1
+                    continue
+                if matched < len(suffix) and ch == suffix[matched]:
+                    matched += 1
+                    pos += 1
+                else:
+                    break
+            if matched == len(suffix):
+                result = new[pos:].strip()
+                return result if result else new
+        return new
 
     # ── 制御 ──
     def start(self):
@@ -267,15 +335,24 @@ class AudioSTT:
     def stop(self):
         self._running = False
         self._prebuf.clear()
+        self._window_buf.clear()
+        self._window_total_samples = 0
+        self._last_text = ""
         if self._thread:
             self._thread.join(timeout=3.0)
             self._thread = None
         with self._lock:
             self._recent.clear()
+            self._current_partial = ""
 
     def get_recent(self) -> list[str]:
         with self._lock:
             return list(self._recent)
+
+    def get_partial(self) -> str:
+        """当前正在识别的实时文本。"""
+        with self._lock:
+            return self._current_partial
 
     def get_latest(self) -> str:
         with self._lock:
@@ -415,11 +492,12 @@ class RadioPlayer:
         self.is_playing = False
         self.is_paused = False
         self.volume = 80
+        self._curses_mode = False   # curses 模式下禁止 print
 
     # ── mpv の場合は audio-output で Raw PCM を別プロセスに吐出 ──
-    def _build_mpv_args(self, url: str) -> tuple[list[str], list[str]]:
-        """(mpv_args, ffmpeg_args) を返す。"""
-        mpv_args = [
+    def _build_mpv_play_args(self, url: str) -> list[str]:
+        """mpv 播放参数（输出到 coreaudio）。"""
+        return [
             self.backend,
             url,
             "--no-video",
@@ -428,24 +506,20 @@ class RadioPlayer:
             "--no-resume-playback",
             "--force-seekable=yes",
             "--demuxer-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=10",
-            # Raw PCM 出力（ffmpeg が受信）
-            "--audio-display=no",
-            "--audio-channels=mono",
-            "--audio-samplerate=16000",
-            f"--audio-file=pipe:1",
-            "--ao=pcm:file=-",
         ]
-        # ffmpeg: PCM → 16kHz mono WAV → stdout（Whisper が消費）
-        ffmpeg_args = [
+
+    def _build_ffmpeg_stt_args(self, url: str) -> list[str]:
+        """ffmpeg STT capture 参数：HLS → 16kHz mono s16le PCM → stdout。"""
+        return [
             "ffmpeg",
-            "-f", "s16le",          # 入力: signed 16bit little-endian PCM
+            "-re",
+            "-i", url,
+            "-map", "0:a:0",
             "-ar", str(SAMPLE_RATE),
             "-ac", "1",
-            "-i", "pipe:0",
-            "-f", "wav",
+            "-f", "s16le",
             "pipe:1",
         ]
-        return mpv_args, ffmpeg_args
 
     def _build_ffplay_args(self, url: str) -> list[str]:
         return [
@@ -466,28 +540,20 @@ class RadioPlayer:
 
         try:
             if self.stt and self.backend == "mpv":
-                # mpv → ffmpeg pipe → Whisper（mpv が必要、ffplay は非対応）
-                mpv_args, ffmpeg_args = self._build_mpv_args(station["url"])
-
-                # ffmpeg を先に起動（stdin=PIPE, stdout=PIPE）
+                # 播放：mpv（coreaudio）
+                mpv_args = self._build_mpv_play_args(station["url"])
+                self.proc = subprocess.Popen(
+                    mpv_args,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                # STT capture：ffmpeg 单独读 HLS → 16kHz mono WAV → Whisper
+                ffmpeg_args = self._build_ffmpeg_stt_args(station["url"])
                 self.capture_proc = subprocess.Popen(
                     ffmpeg_args,
-                    stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
                 )
-
-                # mpv の出力を ffmpeg の stdin に接続
-                self.proc = subprocess.Popen(
-                    mpv_args,
-                    stdout=self.capture_proc.stdin,
-                    stderr=subprocess.DEVNULL,
-                )
-                # mpv stdout = ffmpeg stdin（閉じるのは proc 終了時）
-                if self.capture_proc.stdin:
-                    self.capture_proc.stdin.close()
-
-                # ffmpeg stdout を読み取るスレッド → Whisper に渡す
                 t = threading.Thread(target=self._pcm_reader, daemon=True)
                 t.start()
 
@@ -501,27 +567,26 @@ class RadioPlayer:
 
             self.is_playing = True
             self.is_paused = False
-            print(f"\n▶  再生中: {station['name']} ({station['name_zh']})")
-            print(f"   {station['desc']}")
-            if self.stt and self.stt.is_ready():
-                print(f"   🎤 音声認識: 動作中")
-            elif self.stt:
-                print(f"   🎤 音声認識: {self.stt.error() or '初期化中'}")
+            if not self._curses_mode:
+                print(f"\n▶  再生中: {station['name']} ({station['name_zh']})")
+                print(f"   {station['desc']}")
+                if self.stt and self.stt.is_ready():
+                    print(f"   🎤 音声認識: 動作中")
+                elif self.stt:
+                    print(f"   🎤 音声認識: {self.stt.error() or '初期化中'}")
         except Exception as e:
             print(f"再生エラー: {e}", file=sys.stderr)
             self.is_playing = False
 
     def _pcm_reader(self):
-        """ffmpeg stdout（WAV PCM）を読み取って Whisper に送る。"""
+        """ffmpeg stdout（s16le PCM）を読み取って Whisper に送る。"""
         try:
             with self.capture_proc.stdout as stdout:
-                buf = io.BytesIO()
-                chunk_size = SAMPLE_RATE * 2 * CHUNK_DURATION  # 2 bytes/sample
+                chunk_size = int(SAMPLE_RATE * 2 * CHUNK_DURATION)  # 2 bytes/sample
                 while True:
                     chunk = stdout.read(chunk_size)
                     if not chunk:
                         break
-                    # WAV バイナリを構築
                     wav_buf = io.BytesIO()
                     with wave.open(wav_buf, "wb") as w:
                         w.setnchannels(1)
@@ -569,11 +634,13 @@ class RadioPlayer:
                 self.play(self.current_station)
 
         state = "一時停止中" if self.is_paused else "再生中"
-        print(f"\n{'⏸' if self.is_paused else '▶'}  {state}")
+        if not self._curses_mode:
+            print(f"\n{'⏸' if self.is_paused else '▶'}  {state}")
 
     def set_volume(self, delta: int):
         self.volume = max(0, min(100, self.volume + delta))
-        print(f"\n🔊  音量: {self.volume}%")
+        if not self._curses_mode:
+            print(f"\n🔊  音量: {self.volume}%")
 
     def status(self) -> str:
         if not self.is_playing:
@@ -596,6 +663,7 @@ except ImportError:
 
 
 def run_curses(stdscr, player: RadioPlayer, all_stations: list, stt: AudioSTT | None):
+    player._curses_mode = True
     curses.curs_set(0)
     stdscr.nodelay(True)
     stdscr.timeout(150)
@@ -608,8 +676,19 @@ def run_curses(stdscr, player: RadioPlayer, all_stations: list, stt: AudioSTT | 
     curses.init_pair(4, curses.COLOR_GREEN, -1)     # 再生中
     curses.init_pair(5, curses.COLOR_RED, -1)       # 停止
     curses.init_pair(6, curses.COLOR_MAGENTA, -1)  # カテゴリ
-    curses.init_pair(7, curses.COLOR_GREEN, -1)    # 認識テキスト
-    curses.init_pair(8, curses.COLOR_WHITE, -1)     # 認識テキスト背景
+    # 字幕配色（从顶部配置读取）
+    _color_map = {
+        "WHITE": curses.COLOR_WHITE, "GREEN": curses.COLOR_GREEN,
+        "CYAN": curses.COLOR_CYAN, "YELLOW": curses.COLOR_YELLOW,
+        "RED": curses.COLOR_RED, "MAGENTA": curses.COLOR_MAGENTA,
+        "BLUE": curses.COLOR_BLUE, "DEFAULT": -1,
+    }
+    _stt_hist_fg = _color_map.get(STT_HIST_COLOR, curses.COLOR_WHITE)
+    _stt_hist_bg = _color_map.get(STT_HIST_BG, -1)
+    _stt_live_fg = _color_map.get(STT_LIVE_COLOR, curses.COLOR_YELLOW)
+    _stt_live_bg = _color_map.get(STT_LIVE_BG, -1)
+    curses.init_pair(7, _stt_hist_fg, _stt_hist_bg)   # 歴史字幕
+    curses.init_pair(8, _stt_live_fg, _stt_live_bg)   # 実時字幕
 
     current_idx = 0
     categories = sorted(set(s.get("category", "Other") for s in all_stations))
@@ -622,10 +701,10 @@ def run_curses(stdscr, player: RadioPlayer, all_stations: list, stt: AudioSTT | 
     def draw():
         nonlocal current_idx, stt_anim_frame, _stt_was_loading
         h, w = stdscr.getmaxyx()
-        stdscr.clear()
+        stdscr.erase()
 
-        # ── STT 下位 3 行提前定义（供全函数使用）──
-        stt_rows = 3
+        # ── STT 下位 5 行提前定义（供全函数使用）──
+        stt_rows = 5
 
         # ── Whisper 加载完成通知 ──
         if stt:
@@ -727,9 +806,9 @@ def run_curses(stdscr, player: RadioPlayer, all_stations: list, stt: AudioSTT | 
 
         # STT 总开关状态：区分「关闭」「加载中/待机」「运行中」
         if not stt_active:
-            stt_lines = ["", f"{stt_label}─── 認識OFF（按 T 开启）───", ""]
+            stt_lines = ["", "", f"{stt_label}─── 認識OFF（按 T 开启）───", "", ""]
         elif stt_err:
-            stt_lines = [f"{stt_label}エラー: {stt_err}", "", ""]
+            stt_lines = ["", f"{stt_label}エラー: {stt_err}", "", "", ""]
         elif stt and stt.is_loading():
             _pct, _dl_bytes, _total_bytes = (
                 stt.download_progress() if hasattr(stt, "download_progress")
@@ -767,32 +846,40 @@ def run_curses(stdscr, player: RadioPlayer, all_stations: list, stt: AudioSTT | 
             stt_lines = [
                 f"  {eta_str}  {stt.loading_msg()}",
                 f"  ▓{bar}▓  {pct_str}  {size_str}",
-                "",
+                "", "", "",
             ]
         elif not stt_ready:
-            stt_lines = [f"{stt_label}待機中...", "", ""]
+            stt_lines = ["", f"{stt_label}待機中...", "", "", ""]
         else:
             recent = stt.get_recent() if stt else []
-            if recent:
-                # 最新 → 下から2行目、1つ前 → 下から3行目、最旧 → 下から1行目
-                display = recent[-3:] if len(recent) >= 3 else recent
-                stt_lines = ["", "", ""]
-                for j, text in enumerate(display):
-                    row_idx = stt_rows - len(display) + j   # 0..2
-                    if row_idx >= 0:
-                        stt_lines[row_idx] = text
-            else:
-                stt_lines = [f"{stt_label}待機中...", "", ""]
+            partial = stt.get_partial() if stt else ""
+            # 前4行=历史，最后1行=当前实时
+            hist_rows = stt_rows - 1
+            display = recent[-hist_rows:] if len(recent) >= hist_rows else recent
+            stt_lines = [""] * stt_rows
+            for j, text in enumerate(display):
+                row_idx = hist_rows - len(display) + j
+                if 0 <= row_idx < hist_rows:
+                    stt_lines[row_idx] = text
+            # 最后一行：当前正在识别（闪烁光标）
+            if partial:
+                blink = "▍" if (stt_anim_frame // 3) % 2 == 0 else " "
+                stt_lines[stt_rows - 1] = f"▸ {partial}{blink}"
+            elif recent:
+                stt_lines[stt_rows - 1] = "▸ ..."
 
         for i, line in enumerate(stt_lines):
             y = stt_sep_y + 1 + i
             if y >= h - 1:
                 break
-            # 認識テキストは緑色、薄い文字で
-            attr = curses.A_DIM | curses.color_pair(7)
-            label = stt_label if (i == 0 and not stt_ready and not stt_err) else ""
+            if i == stt_rows - 1 and stt_ready and not stt_err:
+                # 实时行：亮色粗体（pair 8）
+                attr = curses.color_pair(8) | curses.A_BOLD
+            else:
+                # 历史行（pair 7）
+                attr = curses.color_pair(7)
             try:
-                stdscr.addstr(y, 2, (label + line)[:w-4], attr)
+                stdscr.addstr(y, 2, line[:w-4], attr)
             except curses.error:
                 pass
 
@@ -914,7 +1001,8 @@ def run_simple(player: RadioPlayer, all_stations: list, stt: AudioSTT | None):
                 try:
                     while True:
                         if player.proc and player.proc.poll() is not None:
-                            print("\n⚠  ストリーム接続切れ。")
+                            rc = player.proc.poll()
+                            print(f"\n⚠  ストリーム切断 (exit={rc})。")
                             break
 
                         # 認識結果表示（5秒ごと）
@@ -983,7 +1071,9 @@ def main():
         try:
             curses.wrapper(lambda sc: run_curses(sc, player, all_stations, stt))
         except Exception as e:
+            import traceback
             print(f"\nTUIエラー ({e})、简单モードで起動します。\n")
+            traceback.print_exc()
             run_simple(player, all_stations, stt)
     else:
         print("curses がないため、简单モードで起動します。")
