@@ -180,11 +180,14 @@ class AudioSTT:
 
     # ── キューに音声を追加（mpv/ffplay から呼ばれる） ──
     def feed(self, pcm_chunk: bytes):
+        import sys as _sys
         if not self._running:
             return
         if self._model is not None:
             try:
                 self._audio_queue.put_nowait(pcm_chunk)
+                _sys.stderr.write(f"[feed] queued chunk={len(pcm_chunk)}\n")
+                _sys.stderr.flush()
             except queue.Full:
                 pass
         else:
@@ -209,10 +212,16 @@ class AudioSTT:
                 raw = self._audio_queue.get(timeout=2.0)
             except queue.Empty:
                 continue
+            import sys as _sys
+            _sys.stderr.write(f"[worker] got chunk from queue, len={len(raw)}\n")
+            _sys.stderr.flush()
             self._transcribe_chunk(raw)
 
     def _transcribe_chunk(self, raw: bytes):
         """对一个 WAV chunk 进行识别，结果写入 _recent。"""
+        import sys as _sys
+        _sys.stderr.write(f"[Whisper] transcribe_chunk called, raw_len={len(raw)}\n")
+        _sys.stderr.flush()
         try:
             pcm = self._wav_to_pcm(raw)
         except Exception:
@@ -224,8 +233,6 @@ class AudioSTT:
                 io.BytesIO(pcm),
                 language=self.language,
                 beam_size=5,
-                vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=300),
             )
             text_parts = []
             for seg in segments:
@@ -241,6 +248,11 @@ class AudioSTT:
                     self._transcript_queue.put_nowait(text)
                 except queue.Full:
                     pass
+            else:
+                # 调试：空结果也打印（删掉这3行后性能恢复正常）
+                import sys as _sys
+                _sys.stderr.write(f"[Whisper] chunk={len(pcm)//(SAMPLE_RATE*2)}秒 空结果 lang={self.language}\n")
+                _sys.stderr.flush()
         except Exception:
             pass
 
@@ -453,8 +465,8 @@ class RadioPlayer:
         self.current_station = station
 
         try:
-            if self.backend == "mpv" and self.stt:
-                # mpv → pipe → ffmpeg → WAV PCM → Whisper
+            if self.stt and self.backend == "mpv":
+                # mpv → ffmpeg pipe → Whisper（mpv が必要、ffplay は非対応）
                 mpv_args, ffmpeg_args = self._build_mpv_args(station["url"])
 
                 # ffmpeg を先に起動（stdin=PIPE, stdout=PIPE）

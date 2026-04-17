@@ -1,47 +1,56 @@
 # NHK Radio News Player (with Real-time Japanese Transcription)
 
-Language: [日本語](README.ja.md) | [中文](README.zh-CN.md)
+Language: [日本語](README.ja.md) | [中文](README.zh-CN.md) | [English](README.en.md)
 
-This is a terminal-based (CUI) Japanese radio player that streams online stations and optionally provides real-time Japanese speech-to-text transcription via Whisper.
+A terminal-based (CUI) Japanese radio player that streams NHK and regional stations, with optional real-time Japanese speech-to-text transcription via Whisper.
 
 ## Overview
 
-- Playback: Streams NHK and selected Japanese internet radio stations (mpv first, ffplay fallback)
-- Transcription: Real-time Japanese STT using faster-whisper, with download/recognition progress shown in the terminal UI
-- TUI: curses-based interface for playback status, station list, and transcript output
-- Model cache: Whisper models are stored in .whisper_models next to the script, so later runs start quickly
+- **Playback:** NHK national 3 channels + regional FM live streams (mpv preferred, ffplay fallback)
+- **Transcription:** Real-time Japanese STT using faster-whisper; model download progress and transcript text shown directly in the terminal UI footer
+- **TUI:** curses-based interface with playback status, station list, category filtering, and transcript output (up to 3 lines, scrolling)
+- **Model cache:** Whisper models stored in `.whisper_models/` next to the script; subsequent runs start instantly
 
 ## Built-in Stations
 
+### NHK National
 | Station | Description |
 |---------|-------------|
-| NHK Radio 1 | General news and information |
-| NHK Radio 2 | Education and language programs |
-| NHK FM | Music and culture |
+| NHK Radio 1 | General news & weather |
+| NHK Radio 2 | Education & language |
+| NHK FM | Music & culture |
+
+### NHK Regional (DEFAULT_AREA = "tokyo")
+Supported: Sapporo, Sendai, Tokyo, Nagoya, Osaka, Hiroshima, Matsuyama, Fukuoka (use `c` to cycle categories)
 
 ## Requirements
 
 - Python 3.8+
-- macOS: install mpv (brew install mpv)
-- Linux: install mpv or ffmpeg (sudo apt install mpv / sudo apt install ffmpeg)
-- Optional STT dependency: pip install -r requirements.txt
+- **macOS:** `brew install mpv`
+- **Linux:** `sudo apt install mpv`
+- **STT (optional):** `pip install -r requirements.txt`
+
+> ⚠️ **Note:** Real-time speech-to-text (STT) requires `mpv`. `ffplay` does not support audio piping, so STT is unavailable when using ffplay.
 
 ## Installation
 
 ```bash
-cd radio
+# 1. Homebrew (if not installed)
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 
-# Playback dependency (required)
+# 2. Install mpv
 brew install mpv        # macOS
-# sudo apt install mpv  # Linux
+# sudo apt install mpv  # Linux (Ubuntu/Debian)
+# sudo dnf install mpv  # Linux (Fedora)
 
-# Speech-to-text dependency (optional)
+# 3. Install STT dependencies (optional)
 pip install -r requirements.txt
 ```
 
 ## Usage
 
 ```bash
+cd radio
 python radio_player.py
 ```
 
@@ -49,36 +58,38 @@ python radio_player.py
 
 | Key | Action |
 |-----|--------|
-| ↑ / ↓ | Select station |
+| ↑ / ↓ or j | Select station |
 | Enter | Start playback |
 | p / Space | Pause / Resume |
 | s | Stop and return to home |
-| + / - | Volume up/down |
+| + / - | Volume up / down |
+| c | Cycle station category (NHK National / NHK Regional / ...) |
+| t | Toggle STT (speech recognition) ON / OFF |
 | q | Quit |
 
 ## STT Model Management
 
 | Operation | Location |
 |-----------|----------|
-| Cache directory | .whisper_models (same level as script) |
-| Model selection | Edit WHISPER_MODEL at top of script (tiny/small/medium/large-v3) |
-| Remove cache | Delete .whisper_models |
+| Cache directory | `.whisper_models/` (same level as script) |
+| Model selection | Edit `WHISPER_MODEL` at top of script (tiny/small/medium/large-v3) |
+| Remove cache | Delete the `.whisper_models/` directory |
 
-Note: The model is downloaded only on first use. The medium model is about 1.5GB.
+> The model is downloaded only on first use (medium model ~1.5GB). Download progress is shown live in the UI footer.
 
 ## Main Settings (top of radio_player.py)
 
 ```python
-DEFAULT_AREA    = "tokyo"
-ENABLE_STT      = True
-WHISPER_MODEL   = "medium"
-CHUNK_DURATION  = 8
-WHISPER_LANG    = "ja"
+DEFAULT_AREA    = "tokyo"    # Initial area (see AREA_MAP)
+ENABLE_STT      = True       # Set False to disable STT (faster startup)
+WHISPER_MODEL   = "medium"   # tiny/small/medium/large-v3
+CHUNK_DURATION  = 8          # Audio chunk duration in seconds
+WHISPER_LANG    = "ja"       # Recognition language
 ```
 
 ## Technical Notes
 
-- Most NHK streams use HLS (m3u8)
-- Playback uses mpv first and falls back to ffplay if needed
-- STT model cache path is controlled by HF_HUB_CACHE / HF_HOME
+- NHK streams use HLS (m3u8) — mpv/ffplay handle it automatically
+- STT feature requires `mpv` (ffplay cannot pipe audio)
+- Model cache path controlled by `HF_HUB_CACHE` / `HF_HOME`, stored in `.whisper_models/`
 - Transcription runs in a background thread and does not block the TUI
