@@ -63,8 +63,9 @@ class AudioSTT:
         self._running = False
         self._audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=8)
         self._transcript_queue: queue.Queue[str] = queue.Queue(maxsize=3)
-        # 直近の認識結果（3件保持）
+        # 直近の認識結果（滚动显示，扩大缓冲）
         self._recent: list[str] = []
+        self._prebuf: list[bytes] = []   # model 加载期间暂存音频
         self._lock = threading.Lock()
         self._load_error: str | None = None
         self._loading = True        # モデル加载中フラグ
@@ -179,59 +180,69 @@ class AudioSTT:
 
     # ── キューに音声を追加（mpv/ffplay から呼ばれる） ──
     def feed(self, pcm_chunk: bytes):
-        if self._running and self._model:
+        if not self._running:
+            return
+        if self._model is not None:
             try:
                 self._audio_queue.put_nowait(pcm_chunk)
             except queue.Full:
-                pass  # ドロップしてもOK
+                pass
+        else:
+            # model 加载中 → 暂存到 prebuf
+            self._prebuf.append(pcm_chunk)
+            # prebuf 最多保留 60 秒音频（约 60 * 16000 * 2 = 1.92MB）
+            while len(self._prebuf) > 750:   # ~60s @ 8s chunks
+                self._prebuf.pop(0)
 
     def _worker(self):
         self._ensure_model()
         if not self._model:
             return
 
+        # model 加载完成后，先处理 prebuf（缓冲期间积累的音频）
+        while self._prebuf and self._running:
+            raw = self._prebuf.pop(0)
+            self._transcribe_chunk(raw)
+
         while self._running:
             try:
                 raw = self._audio_queue.get(timeout=2.0)
             except queue.Empty:
                 continue
+            self._transcribe_chunk(raw)
 
-            # WAV → PCM → int16 samples
-            try:
-                pcm = self._wav_to_pcm(raw)
-            except Exception:
-                continue
-
-            if len(pcm) < SAMPLE_RATE // 4:  # 0.25秒以下はスキップ
-                continue
-
-            # faster-whisper 推論
-            try:
-                segments, info = self._model.transcribe(
-                    io.BytesIO(pcm),
-                    language=self.language,
-                    beam_size=5,
-                    vad_filter=True,       # 音声区間検出
-                    vad_parameters=dict(min_silence_duration_ms=500),
-                )
-                text_parts = []
-                for seg in segments:
-                    if seg.text.strip():
-                        text_parts.append(seg.text.strip())
-
-                if text_parts:
-                    text = " ".join(text_parts)
-                    with self._lock:
-                        self._recent.append(text)
-                        if len(self._recent) > 3:
-                            self._recent.pop(0)
-                    try:
-                        self._transcript_queue.put_nowait(text)
-                    except queue.Full:
-                        pass
-            except Exception as e:
-                # 推論エラーは無視して継続
-                pass
+    def _transcribe_chunk(self, raw: bytes):
+        """对一个 WAV chunk 进行识别，结果写入 _recent。"""
+        try:
+            pcm = self._wav_to_pcm(raw)
+        except Exception:
+            return
+        if len(pcm) < SAMPLE_RATE // 8:  # 0.125秒以下はスキップ
+            return
+        try:
+            segments, info = self._model.transcribe(
+                io.BytesIO(pcm),
+                language=self.language,
+                beam_size=5,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=300),
+            )
+            text_parts = []
+            for seg in segments:
+                if seg.text.strip():
+                    text_parts.append(seg.text.strip())
+            if text_parts:
+                text = " ".join(text_parts)
+                with self._lock:
+                    self._recent.append(text)
+                    if len(self._recent) > 20:
+                        self._recent.pop(0)
+                try:
+                    self._transcript_queue.put_nowait(text)
+                except queue.Full:
+                    pass
+        except Exception:
+            pass
 
     # ── 制御 ──
     def start(self):
@@ -243,6 +254,7 @@ class AudioSTT:
 
     def stop(self):
         self._running = False
+        self._prebuf.clear()
         if self._thread:
             self._thread.join(timeout=3.0)
             self._thread = None
@@ -600,6 +612,9 @@ def run_curses(stdscr, player: RadioPlayer, all_stations: list, stt: AudioSTT | 
         h, w = stdscr.getmaxyx()
         stdscr.clear()
 
+        # ── STT 下位 3 行提前定义（供全函数使用）──
+        stt_rows = 3
+
         # ── Whisper 加载完成通知 ──
         if stt:
             was_loading = _stt_was_loading
@@ -647,10 +662,9 @@ def run_curses(stdscr, player: RadioPlayer, all_stations: list, stt: AudioSTT | 
         except curses.error:
             pass
 
-        # ── 局リスト（ただし下位 3 行は STT 表示に確保）──
+        # ── 局リスト（STT 下位 3 行を確保）──
         visible = get_visible(filter_cat)
         start_y = 3
-        stt_rows = 3
         max_list_rows = h - start_y - stt_rows - 2   # 区切り＋操作説明
         if max_list_rows < 3:
             max_list_rows = 5
@@ -699,8 +713,10 @@ def run_curses(stdscr, player: RadioPlayer, all_stations: list, stt: AudioSTT | 
         stt_ready = stt and stt.is_ready()
         stt_err   = stt.error() if stt else None
 
-        # ── 下载进度条（实时显示）──
-        if stt_err:
+        # STT 总开关状态：区分「关闭」「加载中/待机」「运行中」
+        if not stt_active:
+            stt_lines = ["", f"{stt_label}─── 認識OFF（按 T 开启）───", ""]
+        elif stt_err:
             stt_lines = [f"{stt_label}エラー: {stt_err}", "", ""]
         elif stt and stt.is_loading():
             _pct, _dl_bytes, _total_bytes = (
