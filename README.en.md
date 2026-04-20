@@ -8,8 +8,10 @@ A terminal-based (CUI) Japanese radio player that streams NHK and regional stati
 
 - **Playback:** NHK national 3 channels + regional FM live streams (mpv preferred, ffplay fallback)
 - **Transcription:** Real-time Japanese STT using faster-whisper; model download progress and transcript text shown directly in the terminal UI footer
-- **TUI:** curses-based interface with playback status, station list, category filtering, and transcript output (up to 3 lines, scrolling)
+- **Subtitle Sync:** Audio timestamp tracking with delayed display — captions appear only when audio reaches their corresponding moment, with ~0.5s sync latency
+- **TUI:** curses-based interface with playback status, station list, category filtering, and transcript output (up to 4 scrolling history lines + live line)
 - **Model cache:** Whisper models stored in `.whisper_models/` next to the script; subsequent runs start instantly
+- **Audio cache:** WAV files cached to `.audio_cache/` during playback for subtitle time synchronization
 
 ## Built-in Stations
 
@@ -50,7 +52,7 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-cd radio
+cd /path/to/jp_radio
 python radio_player.py
 ```
 
@@ -67,13 +69,24 @@ python radio_player.py
 | t | Toggle STT (speech recognition) ON / OFF |
 | q | Quit |
 
+## Subtitle Synchronization
+
+Transcribed subtitles are not displayed immediately — they appear based on audio playback progress:
+
+- **Mechanism:** Each audio chunk records its timestamp → Whisper recognizes → Caption displays when audio reaches that moment
+- **Latency:** Default 0.5 seconds (SYNC_DELAY adjustable)
+- **Indicator:** Live line shows `[x.xs behind]` to indicate the delay between current caption and playback position
+
+> Since Whisper recognition takes 1-2 seconds of processing time, actual sync accuracy depends on model speed and audio content complexity.
+
 ## STT Model Management
 
 | Operation | Location |
 |-----------|----------|
 | Cache directory | `.whisper_models/` (same level as script) |
+| Audio cache | `.audio_cache/` (auto-generated, auto-cleaned after playback stops) |
 | Model selection | Edit `WHISPER_MODEL` at top of script (tiny/small/medium/large-v3) |
-| Remove cache | Delete the `.whisper_models/` directory |
+| Remove cache | Delete the corresponding directory |
 
 > The model is downloaded only on first use (medium model ~1.5GB). Download progress is shown live in the UI footer.
 
@@ -82,9 +95,12 @@ python radio_player.py
 ```python
 DEFAULT_AREA    = "tokyo"    # Initial area (see AREA_MAP)
 ENABLE_STT      = True       # Set False to disable STT (faster startup)
-WHISPER_MODEL   = "medium"   # tiny/small/medium/large-v3
-CHUNK_DURATION  = 8          # Audio chunk duration in seconds
+WHISPER_MODEL   = "small"    # tiny/small/medium/large-v3 (recommended: small, balance of speed & accuracy)
+CHUNK_DURATION  = 1.0        # Audio chunk duration in seconds (1-2s recommended, shorter = lower latency)
+SAMPLE_RATE     = 16000      # Sample rate (fixed 16kHz)
 WHISPER_LANG    = "ja"       # Recognition language
+STT_HIST_COLOR  = "WHITE"    # History subtitle color (WHITE/GREEN/CYAN/YELLOW)
+STT_LIVE_COLOR  = "YELLOW"   # Live subtitle color
 ```
 
 ## Technical Notes
@@ -93,3 +109,4 @@ WHISPER_LANG    = "ja"       # Recognition language
 - STT feature requires `mpv` (ffplay cannot pipe audio)
 - Model cache path controlled by `HF_HUB_CACHE` / `HF_HOME`, stored in `.whisper_models/`
 - Transcription runs in a background thread and does not block the TUI
+- Audio cache used for time synchronization, auto-cleaned after playback stops
