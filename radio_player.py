@@ -18,19 +18,44 @@ import io
 import tempfile
 import xml.etree.ElementTree as ET
 import wave
+from difflib import SequenceMatcher
 import numpy as np
 from urllib.request import urlopen, Request
 from urllib.error import URLError
 
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
 # ──────────────────────────────────────────────
 # 1.  Settings
 # ──────────────────────────────────────────────
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIONS_CONFIG_PATH = os.path.join(SCRIPT_DIR, "stations.yaml")
 DEFAULT_AREA = "tokyo"
 ENABLE_STT = True           # False で STT を無効化（起動を速くする）
-WHISPER_MODEL = "medium"     # tiny≈実時/small≈実時+精度/medium=精度重視(CPU遅い)
-CHUNK_DURATION = 1.0        # 秒ごとキャプチャ（短いほど実時間性↑、精度↓）
+WHISPER_MODEL = "small"  # tiny/base/small/medium/large-v2/large-v3/large-v3-turbo
+CHUNK_DURATION = 1.2        # 缩短分块，降低字幕出现延迟
+STT_CONTEXT_SECONDS = 0.8   # 给下一块保留少量上下文，兼顾同步与识别稳定性
 SAMPLE_RATE = 16000
 WHISPER_LANG = "ja"
+WHISPER_BEAM_SIZE = 1       # greedy decoding — 最速
+WHISPER_BEST_OF = 1
+WHISPER_TEMPERATURE = 0.0
+WHISPER_CONDITION_ON_PREVIOUS_TEXT = False  # 实时字幕更稳定，减少重复与越滚越慢
+WHISPER_NO_SPEECH_THRESHOLD = 0.7
+SUBTITLE_EMIT_RATIO = 0.35  # 在片段前 35% 左右就显示，体感更接近实时
+WHISPER_INITIAL_PROMPT = "これは日本語のラジオ音声です。ニュース、天気、交通情報、アナウンサーの会話を、英字ではなく自然な日本語で書き起こしてください。"
+
+PCM_BYTES_PER_SECOND = SAMPLE_RATE * 2
+MAX_PROMPT_CHARS = 80
+MIN_OVERLAP_CHARS = 4
+MAX_OVERLAP_CHARS = 24
+MIN_EMIT_INTERVAL = 0.45
+SIMILAR_EMIT_INTERVAL = 0.8
+MIN_SEGMENT_DURATION = 0.05
+MIN_NEW_SEGMENT_END = 0.05
 
 # ── TUI 字幕配色（curses color 番号）──
 # 黒背景で見やすい配色: 歴史行=白, 実時行=黄色太字
@@ -80,10 +105,11 @@ class AudioSTT:
         self._lock = threading.Lock()
         # 逐块识别状态
         self._prev_text: str = ""   # 前一块识别文本（用于 initial_prompt 上下文）
+        self._last_emitted_text: str = ""
+        self._last_emitted_audio_time: float = 0.0
+        self._pcm_tail: bytes = b""   # 给下一块保留一点上下文，避免短块切断句子
         self._transcribing = False  # 识别进行中标志
         self._is_music = False      # 当前为音乐/非语音
-        self._chunk_accum: bytes = b""  # 累积 PCM（攒够 2 块再识别，减少短片段误识别）
-        self._chunk_accum_audio_time: float = 0.0  # 累积块的起始音频时间
         self._load_error: str | None = None
         self._loading = True        # モデル加载中フラグ
         self._loading_msg: str = f"Whisper モデル下载中 ({model_name})..."
@@ -97,7 +123,7 @@ class AudioSTT:
         _sizes = {
             "tiny":75*1024*1024,"base":140*1024*1024,"small":480*1024*1024,
             "medium":1500*1024*1024,"large-v2":3100*1024*1024,"large-v3":3100*1024*1024,
-            "large":3100*1024*1024,
+            "large":3100*1024*1024,"large-v3-turbo":1600*1024*1024,
         }
         for k in list(_sizes):  # list() prevents dict size change during iteration
             _sizes[k+"+.en"] = _sizes[k]
@@ -108,17 +134,23 @@ class AudioSTT:
     def _dl_progress_worker(self):
         """后台线程：每 0.3s 扫描模型目录计算下载进度。"""
         self._dl_start_time = time.monotonic()
-        # 记录扫描开始前目录的基线大小（排除已有模型文件的干扰）
-        baseline = 0
-        try:
-            if self._model_cache and os.path.isdir(self._model_cache):
-                baseline = sum(
+        # 模型目录路径
+        model_dir = os.path.join(self._model_cache, f"models--Systran--faster-whisper-{self.model_name}")
+
+        def _scan_dir_size(path: str, exclude_incomplete=True) -> int:
+            """扫描目录总大小（可排除 .incomplete 文件）。"""
+            try:
+                return sum(
                     os.path.getsize(os.path.join(root, f))
-                    for root, _, files in os.walk(self._model_cache)
+                    for root, _, files in os.walk(path)
                     for f in files
+                    if not (exclude_incomplete and f.endswith(".incomplete"))
                 )
-        except Exception:
-            pass
+            except Exception:
+                return 0
+
+        # 记录扫描开始前已完成文件的基线大小（不含 .incomplete）
+        baseline = _scan_dir_size(model_dir, exclude_incomplete=True)
         # 如果基线已 >= 模型大小，说明已缓存，走加载模式而非下载模式
         is_cached = baseline >= self._model_total_bytes * 0.8
         if is_cached:
@@ -134,20 +166,25 @@ class AudioSTT:
                 self._loading_msg = f"Whisper モデル読込中 ({self.model_name})... {elapsed:.0f}s"
                 time.sleep(0.3)
         else:
-            # 首次下载：扫描文件增量
+            # 首次下载：直接用已完成文件大小 / 总大小显示进度
+            # 注意：.incomplete 文件会被 huggingface_hub 逐步转为正式文件，
+            # 所以 exclude_incomplete 后每次扫描只会看到正式文件的增量进度，
+            # 无法实时反映 .incomplete 的下载进度。
+            # 为解决这个问题：进度 = (baseline + .incomplete 大小) / total
+            # 这样能看到下载中的文件增长
             while self._loading and self._dl_progress < 99.0:
-                try:
-                    if self._model_cache and os.path.isdir(self._model_cache):
-                        total = sum(
-                            os.path.getsize(os.path.join(root, f))
-                            for root, _, files in os.walk(self._model_cache)
-                            for f in files
-                        )
-                        new_bytes = max(0, total - baseline)
-                        self._dl_downloaded = new_bytes
-                        self._dl_progress = min(99.0, new_bytes / self._model_total_bytes * 100)
-                except Exception:
-                    pass
+                # 已完成文件（不含 .incomplete）
+                completed = _scan_dir_size(model_dir, exclude_incomplete=True)
+                # 下载中的文件（含 .incomplete）
+                downloading = sum(
+                    os.path.getsize(os.path.join(root, f))
+                    for root, _, files in os.walk(model_dir)
+                    for f in files
+                    if f.endswith(".incomplete")
+                )
+                total_downloaded = completed + downloading
+                self._dl_downloaded = total_downloaded
+                self._dl_progress = min(99.0, total_downloaded / self._model_total_bytes * 100)
                 time.sleep(0.3)
         self._dl_downloaded = self._model_total_bytes
         self._dl_progress = 100.0
@@ -260,6 +297,28 @@ class AudioSTT:
         else:
             pass
 
+    def _is_similar_text(self, new_text: str, old_text: str) -> bool:
+        if not new_text or not old_text:
+            return False
+        if new_text == old_text:
+            return True
+        if new_text in old_text or old_text in new_text:
+            shorter = min(len(new_text), len(old_text))
+            longer = max(len(new_text), len(old_text))
+            if shorter >= 6 or shorter / max(1, longer) >= 0.8:
+                return True
+        return SequenceMatcher(None, new_text, old_text).ratio() >= 0.88
+
+    def _trim_repeated_prefix(self, new_text: str, old_text: str) -> str:
+        if not new_text or not old_text:
+            return new_text
+        max_overlap = min(len(new_text), len(old_text), MAX_OVERLAP_CHARS)
+        for overlap in range(max_overlap, MIN_OVERLAP_CHARS - 1, -1):
+            if old_text.endswith(new_text[:overlap]):
+                trimmed = new_text[overlap:].lstrip(" 　、。,.!！?？")
+                return trimmed or ""
+        return new_text
+
     def _worker(self):
         self._ensure_model()
         if not self._model:
@@ -273,6 +332,15 @@ class AudioSTT:
                 audio_time, raw = self._audio_queue.get(timeout=2.0)
             except queue.Empty:
                 continue
+
+            # ── 跳过积压：如果队列里还有更新的音频，丢弃旧的 ──
+            skipped = 0
+            while not self._audio_queue.empty():
+                try:
+                    audio_time, raw = self._audio_queue.get_nowait()
+                    skipped += 1
+                except queue.Empty:
+                    break
             # 解码 WAV → PCM
             if len(raw) < 44:
                 continue
@@ -283,74 +351,104 @@ class AudioSTT:
             except Exception:
                 continue
 
-            # 累积 PCM 到缓冲，保留起始时间戳
-            if self._chunk_accum_audio_time == 0.0:
-                self._chunk_accum_audio_time = audio_time
-            self._chunk_accum += pcm
-            accum_sec = len(self._chunk_accum) / (SAMPLE_RATE * 2)
-
-            # 每累积 >= 2s 就识别一次（但 chunk 只有 1s，所以每 2 个 chunk 触发）
-            if accum_sec >= 2.0:
-                self._transcribe_pcm(self._chunk_accum, self._chunk_accum_audio_time)
-                self._chunk_accum = b""
-                self._chunk_accum_audio_time = 0.0
+            self._transcribe_pcm(pcm, audio_time)
 
     def _transcribe_pcm(self, pcm: bytes, audio_time: float):
         """PCM bytes + 音频起始时间戳 → 识别。"""
-        if len(pcm) < SAMPLE_RATE * 2 // 4:
+        if len(pcm) < PCM_BYTES_PER_SECOND // 4:
             return
+
+        tail_bytes = int(PCM_BYTES_PER_SECOND * STT_CONTEXT_SECONDS)
+        context_pcm = self._pcm_tail[-tail_bytes:] if tail_bytes > 0 else b""
+        merged_pcm = context_pcm + pcm if context_pcm else pcm
+        context_seconds = len(context_pcm) / PCM_BYTES_PER_SECOND
+        merged_audio_time = max(0.0, audio_time - context_seconds)
+        self._pcm_tail = merged_pcm[-tail_bytes:] if tail_bytes > 0 else b""
 
         self._transcribing = True
         try:
-            int16_arr = np.frombuffer(pcm, dtype=np.int16)
+            int16_arr = np.frombuffer(merged_pcm, dtype=np.int16)
             audio = int16_arr.astype(np.float32) / 32768.0
 
-            # 用前一块文本作为 initial_prompt 保持上下文连贯
-            prompt = self._prev_text[-100:] if self._prev_text else None
+            # 用日文广播提示词 + 前一块尾部上下文，尽量稳定输出日文
+            prompt_parts = [WHISPER_INITIAL_PROMPT]
+            if self._prev_text:
+                prompt_parts.append(self._prev_text[-MAX_PROMPT_CHARS:])
+            prompt = " ".join(part for part in prompt_parts if part)
 
             segments, info = self._model.transcribe(
                 audio,
                 language=self.language,
-                beam_size=1,
-                best_of=1,
-                vad_filter=False,
+                beam_size=WHISPER_BEAM_SIZE,
+                best_of=WHISPER_BEST_OF,
+                temperature=WHISPER_TEMPERATURE,
+                vad_filter=True,
                 initial_prompt=prompt,
-                condition_on_previous_text=False,
+                condition_on_previous_text=WHISPER_CONDITION_ON_PREVIOUS_TEXT,
+                word_timestamps=False,
             )
-            text_parts = []
+            emitted_segments: list[tuple[float, str]] = []
             high_no_speech = True
+            default_emit_time = audio_time + max(0.0, CHUNK_DURATION * SUBTITLE_EMIT_RATIO)
+            chunk_text_parts: list[str] = []
+
             for seg in segments:
                 t = seg.text.strip()
-                if seg.no_speech_prob < 0.7:
+                if getattr(seg, "no_speech_prob", 1.0) < WHISPER_NO_SPEECH_THRESHOLD:
                     high_no_speech = False
-                if t:
-                    text_parts.append(t)
+                if not t:
+                    continue
+
+                seg_start = float(getattr(seg, "start", 0.0) or 0.0)
+                seg_end = float(getattr(seg, "end", seg_start) or seg_start)
+                if context_seconds > 0 and seg_end <= context_seconds + MIN_NEW_SEGMENT_END:
+                    continue
+
+                t = self._trim_repeated_prefix(t, self._last_emitted_text)
+                if not t:
+                    continue
+
+                effective_start = max(seg_start, context_seconds)
+                effective_end = max(seg_end, effective_start + MIN_SEGMENT_DURATION)
+                emit_time = merged_audio_time + effective_start + (effective_end - effective_start) * SUBTITLE_EMIT_RATIO
+                emit_time = max(audio_time, emit_time)
+                emitted_segments.append((emit_time, t))
+                chunk_text_parts.append(t)
 
             # 音乐/非语音检测
-            if not text_parts or high_no_speech:
+            if not emitted_segments and high_no_speech:
                 rms = np.sqrt(np.mean(audio ** 2))
-                if rms > 0.01:
-                    self._is_music = True
-                else:
-                    self._is_music = False
+                self._is_music = rms > 0.01
                 with self._lock:
                     self._current_partial = ""
                 return
 
             self._is_music = False
-            chunk_text = "".join(text_parts)
-            self._prev_text = chunk_text  # 保存给下一块做 prompt
+            chunk_text = "".join(chunk_text_parts)
+            if chunk_text:
+                self._prev_text = chunk_text  # 保存给下一块做 prompt
 
             with self._lock:
                 self._current_partial = chunk_text
-                self._current_partial_audio_time = audio_time
-                self._recent.append((audio_time, chunk_text))
-                if len(self._recent) > 50:
-                    self._recent.pop(0)
-            try:
-                self._transcript_queue.put_nowait((audio_time, chunk_text))
-            except queue.Full:
-                pass
+                self._current_partial_audio_time = emitted_segments[-1][0] if emitted_segments else default_emit_time
+
+            for emit_time, seg_text in emitted_segments:
+                if (emit_time - self._last_emitted_audio_time) < MIN_EMIT_INTERVAL and self._is_similar_text(seg_text, self._last_emitted_text):
+                    continue
+                if self._is_similar_text(seg_text, self._last_emitted_text):
+                    time_gap = emit_time - self._last_emitted_audio_time
+                    if time_gap < SIMILAR_EMIT_INTERVAL:
+                        continue
+                with self._lock:
+                    self._recent.append((emit_time, seg_text))
+                    if len(self._recent) > 50:
+                        self._recent.pop(0)
+                    self._last_emitted_text = seg_text
+                    self._last_emitted_audio_time = emit_time
+                try:
+                    self._transcript_queue.put_nowait((emit_time, seg_text))
+                except queue.Full:
+                    pass
         except Exception:
             pass
         finally:
@@ -364,21 +462,39 @@ class AudioSTT:
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
 
-    def stop(self):
-        self._running = False
+    def reset(self):
+        """清空当前识别状态，供切换电台时复用已加载的模型线程。"""
         self._prebuf.clear()
         self._prev_text = ""
+        self._last_emitted_text = ""
+        self._last_emitted_audio_time = 0.0
+        self._pcm_tail = b""
         self._is_music = False
         self._transcribing = False
-        self._chunk_accum = b""
-        self._chunk_accum_audio_time = 0.0
-        if self._thread:
-            self._thread.join(timeout=3.0)
-            self._thread = None
+
+        while True:
+            try:
+                self._audio_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        while True:
+            try:
+                self._transcript_queue.get_nowait()
+            except queue.Empty:
+                break
+
         with self._lock:
             self._recent.clear()
             self._current_partial = ""
             self._current_partial_audio_time = 0.0
+
+    def stop(self):
+        self._running = False
+        self.reset()
+        if self._thread:
+            self._thread.join(timeout=3.0)
+            self._thread = None
 
     def get_recent(self) -> list[tuple[float, str]]:
         """返回最近识别结果列表，每项 (音频时间戳, 文本)。"""
@@ -433,7 +549,7 @@ class AudioSTT:
 # ──────────────────────────────────────────────
 # 3.  放送局データ
 # ──────────────────────────────────────────────
-STATIONS = [
+DEFAULT_STATIONS = [
     {
         "id": "nhk_r1",
         "name": "NHK ラジオ第1",
@@ -442,6 +558,7 @@ STATIONS = [
         "url": "https://simul.drdi.st.nhk/live/3/joined/master.m3u8",
         "logo": "NHK1",
         "category": "NHK",
+        "area": "全国",
     },
     {
         "id": "nhk_r2",
@@ -451,6 +568,7 @@ STATIONS = [
         "url": "https://simul.drdi.st.nhk/live/4/joined/master.m3u8",
         "logo": "NHK2",
         "category": "NHK",
+        "area": "全国",
     },
     {
         "id": "nhk_fm",
@@ -460,9 +578,11 @@ STATIONS = [
         "url": "https://simul.drdi.st.nhk/live/5/joined/master.m3u8",
         "logo": "NHKFM",
         "category": "NHK",
+        "area": "全国",
     },
 ]
 
+DEFAULT_NHK_AREAS = ["tokyo", "osaka", "fukuoka"]
 NHK_CONFIG_URL = "https://www.nhk.or.jp/radio/config/config_web.xml"
 
 AREA_MAP = {
@@ -475,6 +595,40 @@ AREA_MAP = {
     "matsuyama": "松山",
     "fukuoka":   "福岡",
 }
+
+
+def load_station_settings() -> tuple[list[dict], list[str], str]:
+    if not os.path.exists(STATIONS_CONFIG_PATH):
+        return DEFAULT_STATIONS[:], DEFAULT_NHK_AREAS[:], DEFAULT_AREA
+    if yaml is None:
+        raise RuntimeError("stations.yaml を使うには PyYAML が必要です。pip install -r requirements.txt を実行してください。")
+
+    with open(STATIONS_CONFIG_PATH, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+
+    stations = data.get("stations") or DEFAULT_STATIONS
+    nhk_areas = data.get("nhk_areas") or DEFAULT_NHK_AREAS
+    default_area = data.get("default_area") or (nhk_areas[0] if nhk_areas else DEFAULT_AREA)
+
+    valid_stations = []
+    for s in stations:
+        if not isinstance(s, dict):
+            continue
+        if not all(s.get(k) for k in ("id", "name", "name_zh", "desc", "url")):
+            continue
+        station = dict(s)
+        station.setdefault("logo", station["id"].upper())
+        station.setdefault("category", "Custom")
+        station.setdefault("area", "全国")
+        valid_stations.append(station)
+
+    valid_areas = [a for a in nhk_areas if a in AREA_MAP]
+    if not valid_areas:
+        valid_areas = DEFAULT_NHK_AREAS[:]
+    if default_area not in AREA_MAP:
+        default_area = valid_areas[0]
+
+    return valid_stations, valid_areas, default_area
 
 
 def fetch_nhk_regional(area_key: str = DEFAULT_AREA) -> list[dict]:
@@ -499,19 +653,41 @@ def fetch_nhk_regional(area_key: str = DEFAULT_AREA) -> list[dict]:
                 el = data.find(key)
                 if el is not None and el.text:
                     base_id = key.replace("hls", "")
+                    desc = f"{label} {city_name}"
+                    if key == "r1hls":
+                        desc += " — 地域ニュース・情報"
+                    elif key == "r2hls":
+                        desc += " — 教育・語学・トーク"
+                    else:
+                        desc += " — 音楽・文化"
                     result.append({
                         "id": f"nhk_{base_id}_{area_key}",
                         "name": f"{label}（{city_name}）",
                         "name_zh": f"NHK {zh_label}（{city_name}）",
-                        "desc": f"{label} {city_name} フィラー",
+                        "desc": desc,
                         "url": el.text.strip(),
                         "logo": f"NHK{base_id.upper()}",
-                        "category": f"NHK-{city_name}",
+                        "category": "NHK",
+                        "area": city_name,
                     })
             return result
     except Exception as e:
         print(f"[警告] NHK XML取得失敗 ({e})、デフォルトURLを使用", file=sys.stderr)
     return []
+
+
+def build_station_list(stations: list[dict], nhk_areas: list[str]) -> list[dict]:
+    all_stations = list(stations)
+    for area in nhk_areas:
+        all_stations.extend(fetch_nhk_regional(area))
+
+    seen = {}
+    for s in all_stations:
+        seen[s["id"]] = s
+
+    result = list(seen.values())
+    result.sort(key=lambda s: (s.get("category", ""), s.get("area", ""), s["id"]))
+    return result
 
 
 # ──────────────────────────────────────────────
@@ -663,6 +839,10 @@ class RadioPlayer:
         self.stop()
         self.current_station = station
 
+        # 切换电台时重置 STT（旧电台音频已无效）
+        if self.stt:
+            self.stt.reset()
+
         try:
             if self.stt and self.backend == "mpv":
                 # ── FIFO 方式：mpv 播放 + stream-record → FIFO → ffmpeg → STT ──
@@ -713,21 +893,24 @@ class RadioPlayer:
             self.is_playing = False
 
     def _pcm_reader(self):
-        """ffmpeg stdout（s16le PCM）を読み取って Whisper + 缓存发送。"""
+        """ffmpeg stdout（s16le PCM）を 1 秒ごとに読み取り、Whisper + 缓存发送。"""
         # 用 time.monotonic() 记录音频流开始时间
         first_chunk_time = None
         bytes_written = 0  # 已写入缓存的总字节数（用于推算音频时间）
         try:
             with self.capture_proc.stdout as stdout:
-                chunk_size = int(SAMPLE_RATE * 2 * CHUNK_DURATION)  # 2 bytes/sample
+                chunk_size = int(PCM_BYTES_PER_SECOND * CHUNK_DURATION)
+
                 while True:
                     chunk = stdout.read(chunk_size)
                     if not chunk:
                         break
                     if first_chunk_time is None:
                         first_chunk_time = time.monotonic()
+                        # 切换电台后音频时间从 0 重新计数
+                        bytes_written = 0
                         # 初始化音频缓存
-                        self._init_audio_cache(0.0)  # 音频起始时间从 0 开始
+                        self._init_audio_cache(0.0)
                         self._play_start_wall_time = first_chunk_time
                         self._play_start_audio_offset = 0.0
 
@@ -860,16 +1043,48 @@ def run_curses(stdscr, player: RadioPlayer, all_stations: list, stt: AudioSTT | 
     curses.init_pair(7, _stt_hist_fg, _stt_hist_bg)   # 歴史字幕
     curses.init_pair(8, _stt_live_fg, _stt_live_bg)   # 実時字幕
 
-    current_idx = 0
-    categories = sorted(set(s.get("category", "Other") for s in all_stations))
-    current_cat_idx = 0
-    filter_cat: str | None = None
+    # ── 按分类 > 地区构建分组列表 ──
+    from collections import defaultdict
+    grouped: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+    for s in all_stations:
+        cat = s.get('category', 'Other')
+        area = s.get('area', '')
+        grouped[cat][area].append(s)
 
-    def get_visible(fc: str | None) -> list:
-        return all_stations if fc is None else [s for s in all_stations if s.get("category") == fc]
+    # 扁平化导航列表
+    flat_items: list[tuple[str, dict | None]] = []
+    for cat in sorted(grouped.keys()):
+        flat_items.append((f'━━ {cat} ━━', None))
+        for area in sorted(grouped[cat].keys()):
+            area_label = area if area else '全国'
+            flat_items.append((f'  ▸ {area_label}', None))
+            for station in grouped[cat][area]:
+                flat_items.append((station['name'], station))
+
+    categories = sorted(grouped.keys())
+    filter_modes = [
+        ("全部", lambda s: True),
+        ("ニュース", lambda s: s.get("id", "").startswith("nhk_r1_") and s.get("area") != "全国"),
+    ] + [(c, lambda s, cat=c: s.get("category") == cat) for c in categories]
+    news_filter_idx = next((i for i, (label, _) in enumerate(filter_modes) if label == "ニュース"), 0)
+    filter_mode_idx = news_filter_idx
+    selectable_indices = [idx for idx, (txt, st) in enumerate(flat_items) if st is not None]
+    current_flat_idx = selectable_indices[0] if selectable_indices else 0
+
+    def get_filter_predicate():
+        return filter_modes[filter_mode_idx][1]
+
+    def get_visible() -> list:
+        pred = get_filter_predicate()
+        return [item[1] for item in flat_items if item[1] is not None and pred(item[1])]
+
+    def get_filtered_flat_indices() -> list[int]:
+        pred = get_filter_predicate()
+        return [idx for idx, (_, st) in enumerate(flat_items) if st is not None and pred(st)]
 
     def draw():
-        nonlocal current_idx, stt_anim_frame, _stt_was_loading
+        nonlocal stt_anim_frame, _stt_was_loading, current_flat_idx
+        nonlocal last_live_text, last_live_audio_time, last_live_wall_time
         h, w = stdscr.getmaxyx()
         stdscr.erase()
 
@@ -894,16 +1109,28 @@ def run_curses(stdscr, player: RadioPlayer, all_stations: list, stt: AudioSTT | 
                     pass
 
         # ── タイトル ──
-        title = "📻  日本ラジオ ニュース受信ラジオ"
+        current_filter_label = filter_modes[filter_mode_idx][0]
+        mode_badge = "【ニュース優先】" if current_filter_label == "ニュース" else f"【{current_filter_label}】"
+        title = f"📻  日本ラジオ ニュース受信ラジオ {mode_badge}"
         stdscr.addstr(0, max(0, (w - len(title)) // 2),
-                      title, curses.A_BOLD | curses.color_pair(3))
+                      title[:max(0, w - 1)], curses.A_BOLD | curses.color_pair(3))
         engine_str = f"[{player.backend} | vol:{player.volume}%]"
         stdscr.addstr(0, w - len(engine_str) - 1, engine_str, curses.A_DIM)
 
-        # ── カテゴリバー ──
-        cat_bar = " | ".join((">" + c if c == filter_cat else c) for c in categories)
+        # ── カテゴリバー（分类标签）──
         try:
-            stdscr.addstr(1, 2, cat_bar[:w-4], curses.color_pair(6) | curses.A_DIM)
+            x = 2
+            for idx, (label, _) in enumerate(filter_modes):
+                is_current = (label == current_filter_label)
+                chip = f" {label} "
+                attr = curses.color_pair(1) | curses.A_BOLD if is_current else (curses.color_pair(6) | curses.A_DIM)
+                if x < w - 1:
+                    stdscr.addstr(1, x, chip[:max(0, w - x - 1)], attr)
+                x += len(chip)
+                if idx < len(filter_modes) - 1 and x < w - 1:
+                    sep = "|"
+                    stdscr.addstr(1, x, sep[:max(0, w - x - 1)], curses.A_DIM)
+                    x += len(sep)
         except curses.error:
             pass
 
@@ -923,44 +1150,94 @@ def run_curses(stdscr, player: RadioPlayer, all_stations: list, stt: AudioSTT | 
         except curses.error:
             pass
 
-        # ── 局リスト（STT 下位 3 行を確保）──
-        visible = get_visible(filter_cat)
+        # ── 局リスト（分组显示，STT 下位预留）──
         start_y = 3
-        max_list_rows = h - start_y - stt_rows - 2   # 区切り＋操作説明
+        list_end_y = h - stt_rows - 2
+        max_list_rows = list_end_y - start_y
         if max_list_rows < 3:
             max_list_rows = 5
 
-        current_idx = max(0, min(current_idx, len(visible) - 1))
-        scroll_off = 0
-        if current_idx >= scroll_off + max_list_rows:
-            scroll_off = current_idx - max_list_rows + 1
-        if current_idx < scroll_off:
-            scroll_off = current_idx
+        current_flat_idx = max(0, min(current_flat_idx, len(flat_items) - 1))
+        filtered_flat_indices = get_filtered_flat_indices()
+        filtered_indices = set(filtered_flat_indices)
+        if filtered_flat_indices and current_flat_idx not in filtered_indices:
+            current_flat_idx = filtered_flat_indices[0]
 
-        for i in range(scroll_off, min(len(visible), scroll_off + max_list_rows)):
-            y = start_y + (i - scroll_off)
-            if y >= h - stt_rows - 2:
+        render_items: list[tuple[int, str, dict | None]] = []
+        for i, (txt, station) in enumerate(flat_items):
+            if station is None:
+                next_station_idx = i + 1
+                while next_station_idx < len(flat_items) and flat_items[next_station_idx][1] is None:
+                    next_station_idx += 1
+                if next_station_idx >= len(flat_items) or next_station_idx not in filtered_indices:
+                    continue
+            else:
+                if i not in filtered_indices:
+                    continue
+            render_items.append((i, txt, station))
+
+        row_heights = [1 if station is None else 3 for _, _, station in render_items]
+        selected_render_idx = next((idx for idx, (flat_idx, _, station) in enumerate(render_items)
+                                    if station is not None and flat_idx == current_flat_idx), 0)
+
+        rows_before_selected = sum(row_heights[:selected_render_idx])
+        selected_height = row_heights[selected_render_idx] if render_items else 0
+        target_top_row = max(0, rows_before_selected - max(0, (max_list_rows - selected_height) // 2))
+
+        scroll_render_idx = 0
+        rows_consumed = 0
+        while scroll_render_idx < len(render_items):
+            next_rows = rows_consumed + row_heights[scroll_render_idx]
+            if next_rows > target_top_row:
                 break
-            station = visible[i]
-            is_sel = (i == current_idx)
-            is_playing = (player.is_playing and player.current_station
-                          and player.current_station["id"] == station["id"])
+            rows_consumed = next_rows
+            scroll_render_idx += 1
 
-            marker = "▶" if is_playing else " "
-            sel_attr = curses.color_pair(1) | curses.A_BOLD
-            norm_attr = curses.color_pair(2)
+        # 渲染
+        y = start_y
+        rendered_stations = 0
+        for _, txt, station in render_items[:scroll_render_idx]:
+            if station is not None:
+                rendered_stations += 1
 
-            line1 = f"{marker} {i+1:2d}. {station['name']:<30}"
-            line2 = f"      {station['name_zh']}"
-            line3 = f"      {station['desc']}"
+        for i in range(scroll_render_idx, len(render_items)):
+            flat_idx, txt, station = render_items[i]
+            if station is None:
+                if y >= list_end_y - 1:
+                    break
+                try:
+                    stdscr.addstr(y, 0, " ", curses.A_DIM)
+                    stdscr.addstr(y, 2, txt, curses.A_BOLD | curses.color_pair(3))
+                except curses.error:
+                    pass
+                y += 1
+            else:
+                if y + 2 >= list_end_y:
+                    break
+                is_sel = (flat_idx == current_flat_idx)
+                is_playing = (player.is_playing and player.current_station
+                              and player.current_station["id"] == station["id"])
 
-            try:
-                stdscr.addstr(y,   2, line1[:w-4], sel_attr if is_sel else (norm_attr | curses.A_BOLD))
-                stdscr.addstr(y+1, 4, line2[:w-6], norm_attr if is_sel else curses.A_DIM)
-                stdscr.addstr(y+2, 4, line3[:w-6],
-                              curses.A_DIM | (curses.color_pair(4) if is_playing else curses.A_DIM))
-            except curses.error:
-                pass
+                marker = "▶" if is_playing else " "
+                item_num = rendered_stations + 1
+                sel_attr = curses.color_pair(1) | curses.A_BOLD
+                norm_attr = curses.color_pair(2)
+
+                line1 = f"{marker} {item_num:2d}. {station['name']:<30}"
+                line2 = f"      {station['name_zh']}"
+                line3 = f"      {station['desc']}"
+
+                try:
+                    sel_a = sel_attr if is_sel else norm_attr
+                    dim_a = curses.A_DIM
+                    stdscr.addstr(y,   2, line1[:w-4], sel_a)
+                    stdscr.addstr(y+1, 4, line2[:w-6], sel_a if is_sel else dim_a)
+                    stdscr.addstr(y+2, 4, line3[:w-6],
+                                  sel_a if is_sel else (dim_a | (curses.color_pair(4) if is_playing else dim_a)))
+                except curses.error:
+                    pass
+                rendered_stations += 1
+                y += 3
 
         # ── STT 区切り線 ──
         stt_sep_y = h - stt_rows - 2
@@ -1023,52 +1300,81 @@ def run_curses(stdscr, player: RadioPlayer, all_stations: list, stt: AudioSTT | 
         else:
             recent = stt.get_recent() if stt else []
             partial = stt.get_partial() if stt else ""
+            partial_audio_time = stt.get_partial_audio_time() if stt else 0.0
             # 当前音频播放时间（用于字幕同步）
             cur_audio_time = player.get_current_audio_time() if player else 0.0
-            # 字幕延迟阈值：音频已播放超过此时间才显示字幕
-            SYNC_DELAY = 0.5  # 秒，音频播放 0.5s 后显示对应字幕
+            now_wall_time = time.monotonic()
+            # 体感同步：尽量贴近音频，同时减少占位状态反复出现
+            DISPLAY_LEAD = 0.30   # 秒，最多提前约 300ms 显示
+            MAX_SUBTITLE_LAG = 15.0  # 放宽滞后容忍，避免频繁掉到 lag dropped
+            LIVE_FUTURE_TOLERANCE = 1.5  # 实时行允许更大的超前空间，减少 listening
+            LIVE_HOLD_SECONDS = 2.0  # live 行短暂保留上一条字幕，减少空窗和抖动
             # 前4行=历史，最后1行=当前实时
             hist_rows = stt_rows - 1
             stt_lines = [""] * stt_rows
 
-            # 从历史中选择"已到时间"的字幕（带延迟同步）
-            # 字幕按时间顺序排列，取最新的几条
-            display_items = []  # 提前初始化，避免 NameError
-            if recent:
-                # 过滤出已到时间的字幕
-                due_captions = [(at, text) for at, text in recent if (cur_audio_time - at) >= SYNC_DELAY]
-                # 取最近 hist_rows 条
-                display_items = due_captions[-hist_rows:] if len(due_captions) >= hist_rows else recent[-hist_rows:]
-                for j, (audio_ts, text) in enumerate(display_items):
-                    row_idx = hist_rows - len(display_items) + j
-                    if 0 <= row_idx < hist_rows:
-                        stt_lines[row_idx] = text
+            fresh_recent = []
+            if cur_audio_time > 0:
+                fresh_recent = [
+                    (at, text) for at, text in recent
+                    if -DISPLAY_LEAD <= (cur_audio_time - at) <= MAX_SUBTITLE_LAG
+                ]
+            else:
+                fresh_recent = list(recent)
+
+            # 从历史中选择"已到时间（允许轻微提前）且未过时"的字幕
+            display_items = fresh_recent[-hist_rows:]
+            for j, (_, text) in enumerate(display_items):
+                row_idx = hist_rows - len(display_items) + j
+                if 0 <= row_idx < hist_rows:
+                    stt_lines[row_idx] = text
+
+            latest_lag = None
+            visible_latest_lag = None
+            if recent and cur_audio_time > 0:
+                last_audio_ts, _ = recent[-1]
+                latest_lag = cur_audio_time - last_audio_ts
+            if display_items and cur_audio_time > 0:
+                visible_latest_lag = cur_audio_time - display_items[-1][0]
+
+            live_text = ""
+            live_lag = None
+            if partial:
+                live_text = partial
+                live_lag = (cur_audio_time - partial_audio_time) if (partial_audio_time > 0 and cur_audio_time > 0) else None
+                last_live_text = partial
+                last_live_audio_time = partial_audio_time
+                last_live_wall_time = now_wall_time
+            elif last_live_text and (now_wall_time - last_live_wall_time) <= LIVE_HOLD_SECONDS:
+                live_text = last_live_text
+                live_lag = (cur_audio_time - last_live_audio_time) if (last_live_audio_time > 0 and cur_audio_time > 0) else None
+            elif display_items:
+                live_text = display_items[-1][1]
+                live_lag = (cur_audio_time - display_items[-1][0]) if cur_audio_time > 0 else None
 
             # 最后一行：当前正在识别（闪烁光标）/ 音乐检测
             if stt and stt.is_music():
                 music_anim = ["♪", "♫", "♪♫", "♫♪"]
                 sym = music_anim[(stt_anim_frame // 4) % len(music_anim)]
-                # 显示当前音频时间和字幕延迟差
-                if recent and cur_audio_time > 0:
-                    last_audio_ts, _ = recent[-1]
-                    lag = cur_audio_time - last_audio_ts
-                    lag_str = f" [{lag:.1f}s behind]"
+                if visible_latest_lag is not None and visible_latest_lag > 0.6:
+                    lag_str = f" [{visible_latest_lag:.1f}s behind]"
                 else:
                     lag_str = ""
                 stt_lines[stt_rows - 1] = f"  {sym} 【MUSIC...】{sym}{lag_str}"
-            elif partial:
-                # 实时字幕显示，带延迟指示
+            elif live_text:
                 blink = "▍" if (stt_anim_frame // 3) % 2 == 0 else " "
-                # 如果有上条字幕的时间，计算延迟
-                if recent and cur_audio_time > 0:
-                    last_audio_ts, last_text = recent[-1]
-                    lag = cur_audio_time - last_audio_ts
-                    lag_str = f" [{lag:.1f}s behind]" if lag > 0.1 else ""
+                if live_lag is not None and live_lag > MAX_SUBTITLE_LAG and display_items:
+                    stt_lines[stt_rows - 1] = f"▸ {display_items[-1][1]}{blink}"
+                elif live_lag is not None and live_lag < -LIVE_FUTURE_TOLERANCE and display_items:
+                    stt_lines[stt_rows - 1] = f"▸ {display_items[-1][1]}{blink}"
                 else:
-                    lag_str = ""
-                stt_lines[stt_rows - 1] = f"▸ {partial}{blink}{lag_str}"
-            elif display_items:
-                stt_lines[stt_rows - 1] = "▸ ..."
+                    if live_lag is not None and live_lag > 1.2:
+                        lag_str = f" [{live_lag:.1f}s behind]"
+                    elif live_lag is not None and live_lag < -0.8:
+                        lag_str = f" [{-live_lag:.1f}s early]"
+                    else:
+                        lag_str = ""
+                    stt_lines[stt_rows - 1] = f"▸ {live_text}{blink}{lag_str}"
             else:
                 stt_lines[stt_rows - 1] = ""
 
@@ -1104,6 +1410,9 @@ def run_curses(stdscr, player: RadioPlayer, all_stations: list, stt: AudioSTT | 
 
     stt_anim_frame = 0
     _stt_was_loading = True   # 前回も加载中だったか（完了通知用）
+    last_live_text = ""
+    last_live_audio_time = 0.0
+    last_live_wall_time = 0.0
 
     while True:
         # ── 动画帧递增（在 draw 之前，让动画实时生效）──
@@ -1116,30 +1425,44 @@ def run_curses(stdscr, player: RadioPlayer, all_stations: list, stt: AudioSTT | 
             key = -1
 
         if key != -1:
-            visible = get_visible(filter_cat)
+            visible = get_visible()
+            filtered_flat_indices = get_filtered_flat_indices()
+
+            if filtered_flat_indices and current_flat_idx not in filtered_flat_indices:
+                current_flat_idx = filtered_flat_indices[0]
 
             if key in (curses.KEY_UP, ord("k")):
-                current_idx = max(0, current_idx - 1)
+                if filtered_flat_indices:
+                    cur_pos = filtered_flat_indices.index(current_flat_idx)
+                    if cur_pos > 0:
+                        current_flat_idx = filtered_flat_indices[cur_pos - 1]
             elif key in (curses.KEY_DOWN, ord("j")):
-                current_idx = min(len(visible) - 1, current_idx + 1)
+                if filtered_flat_indices:
+                    cur_pos = filtered_flat_indices.index(current_flat_idx)
+                    if cur_pos < len(filtered_flat_indices) - 1:
+                        current_flat_idx = filtered_flat_indices[cur_pos + 1]
             elif key in (curses.KEY_ENTER, 10, 13):
-                if visible:
-                    player.play(visible[current_idx])
+                if visible and current_flat_idx in filtered_flat_indices:
+                    player.play(flat_items[current_flat_idx][1])
             elif key in (ord(" "), ord("p")):
                 if player.is_playing:
                     player.pause_resume()
-                elif visible:
-                    player.play(visible[current_idx])
+                elif visible and current_flat_idx in filtered_flat_indices:
+                    player.play(flat_items[current_flat_idx][1])
             elif key in (ord("s"), ord("S")):
                 player.stop()
             elif key in (ord("+"), ord("=")):
                 player.set_volume(10)
             elif key in (ord("-"), ord("_")):
                 player.set_volume(-10)
-            elif key in (ord("c"), ord("C")):
-                current_cat_idx = (current_cat_idx + 1) % (len(categories) + 1)
-                filter_cat = None if current_cat_idx == len(categories) else categories[current_cat_idx]
-                current_idx = 0
+            elif key == ord("c"):
+                filter_mode_idx = (filter_mode_idx + 1) % len(filter_modes)
+                filtered_flat_indices = get_filtered_flat_indices()
+                current_flat_idx = filtered_flat_indices[0] if filtered_flat_indices else 0
+            elif key == ord("C"):
+                filter_mode_idx = 0
+                filtered_flat_indices = get_filtered_flat_indices()
+                current_flat_idx = filtered_flat_indices[0] if filtered_flat_indices else 0
             elif key in (ord("t"), ord("T")):
                 # STT ON/OFF
                 stt_active = not stt_active
@@ -1213,7 +1536,7 @@ def run_simple(player: RadioPlayer, all_stations: list, stt: AudioSTT | None):
                         if stt and stt.is_ready():
                             recent = stt.get_recent()
                             if recent:
-                                print(f"\r🎤 {recent[-1][:80]}      ", end="", flush=True)
+                                print(f"\r🎤 {recent[-1][1][:80]}      ", end="", flush=True)
 
                         try:
                             cmd = input().strip()
@@ -1258,16 +1581,13 @@ def main():
         stt.start()   # バックグラウンドでモデル加载 + 待機
 
     # 局リスト構築
-    base_stations = STATIONS[:]
-    regional = fetch_nhk_regional(DEFAULT_AREA)
-    all_stations = base_stations + regional
-    seen = {}
-    for s in all_stations:
-        seen[s["id"]] = s
-    all_stations = list(seen.values())
-    all_stations.sort(key=lambda s: (s.get("category", ""), s["id"]))
+    stations_config, nhk_areas, default_area = load_station_settings()
+    all_stations = build_station_list(stations_config, nhk_areas)
 
     print(f"登録局数: {len(all_stations)}")
+    print(f"NHK地域ロード: {', '.join(AREA_MAP[a] for a in nhk_areas)}")
+    print(f"初期地域: {AREA_MAP.get(default_area, default_area)}")
+    print(f"設定ファイル: {STATIONS_CONFIG_PATH}")
 
     player = RadioPlayer(stt)
 

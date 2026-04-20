@@ -6,24 +6,35 @@ A terminal-based (CUI) Japanese radio player that streams NHK and regional stati
 
 ## Overview
 
-- **Playback:** NHK national 3 channels + regional FM live streams (mpv preferred, ffplay fallback)
+- **Playback:** YAML-configurable stations + NHK national 3 channels + optional multi-area NHK regional streams (mpv preferred, ffplay fallback)
 - **Transcription:** Real-time Japanese STT using faster-whisper; model download progress and transcript text shown directly in the terminal UI footer
 - **Subtitle Sync:** Audio timestamp tracking with delayed display — captions appear only when audio reaches their corresponding moment, with ~0.5s sync latency
 - **TUI:** curses-based interface with playback status, station list, category filtering, and transcript output (up to 4 scrolling history lines + live line)
 - **Model cache:** Whisper models stored in `.whisper_models/` next to the script; subsequent runs start instantly
 - **Audio cache:** WAV files cached to `.audio_cache/` during playback for subtitle time synchronization
 
-## Built-in Stations
+## Station Configuration
 
-### NHK National
+The station list is now maintained in `stations.yaml`:
+
+- `stations`: manually maintained fixed stations
+- `nhk_areas`: NHK regional areas to load dynamically
+- `default_area`: fallback default area
+
+### Default Stations
 | Station | Description |
 |---------|-------------|
 | NHK Radio 1 | General news & weather |
 | NHK Radio 2 | Education & language |
 | NHK FM | Music & culture |
 
-### NHK Regional (DEFAULT_AREA = "tokyo")
-Supported: Sapporo, Sendai, Tokyo, Nagoya, Osaka, Hiroshima, Matsuyama, Fukuoka (use `c` to cycle categories)
+### NHK Regional Expansion
+By default, the app dynamically loads all 8 officially available NHK areas: Sapporo, Sendai, Tokyo, Nagoya, Osaka, Hiroshima, Matsuyama, and Fukuoka.
+This brings in each area's NHK Radio 1 / Radio 2 / FM streams, making it easier to compare regional news and talk coverage.
+
+> For Japanese news / talk listening, NHK Radio 1 regional variants are the best fit in the current set. NHK Radio 2 is more education/language focused, and NHK FM is mostly music/culture.
+>
+> The TUI now includes a **News** filter that shows only regional `NHK Radio 1` stations for faster news/talk browsing.
 
 ## Requirements
 
@@ -45,7 +56,7 @@ brew install mpv        # macOS
 # sudo apt install mpv  # Linux (Ubuntu/Debian)
 # sudo dnf install mpv  # Linux (Fedora)
 
-# 3. Install STT dependencies (optional)
+# 3. Install STT / YAML config dependencies (optional)
 pip install -r requirements.txt
 ```
 
@@ -65,9 +76,12 @@ python radio_player.py
 | p / Space | Pause / Resume |
 | s | Stop and return to home |
 | + / - | Volume up / down |
-| c | Cycle station category (NHK National / NHK Regional / ...) |
+| c | Cycle filters (All / News / each category) |
+| C | Clear filter back to All |
 | t | Toggle STT (speech recognition) ON / OFF |
 | q | Quit |
+
+> On startup, the TUI now opens in the **News** filter by default, showing regional `NHK Radio 1` stations first.
 
 ## Subtitle Synchronization
 
@@ -93,10 +107,11 @@ Transcribed subtitles are not displayed immediately — they appear based on aud
 ## Main Settings (top of radio_player.py)
 
 ```python
-DEFAULT_AREA    = "tokyo"    # Initial area (see AREA_MAP)
+STATIONS_CONFIG_PATH = "stations.yaml"  # station config file
+DEFAULT_AREA    = "tokyo"    # fallback area when config is missing
 ENABLE_STT      = True       # Set False to disable STT (faster startup)
-WHISPER_MODEL   = "small"    # tiny/small/medium/large-v3 (recommended: small, balance of speed & accuracy)
-CHUNK_DURATION  = 1.0        # Audio chunk duration in seconds (1-2s recommended, shorter = lower latency)
+WHISPER_MODEL   = "medium"  # tiny/small/medium/large-v2/large-v3 (recommended: large-v2 for Japanese, high accuracy; medium is faster)
+CHUNK_DURATION  = 3.0        # Audio chunk duration in seconds (3-5s recommended, longer = more context = better accuracy)
 SAMPLE_RATE     = 16000      # Sample rate (fixed 16kHz)
 WHISPER_LANG    = "ja"       # Recognition language
 STT_HIST_COLOR  = "WHITE"    # History subtitle color (WHITE/GREEN/CYAN/YELLOW)

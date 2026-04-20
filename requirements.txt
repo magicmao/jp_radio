@@ -1,3 +1,4 @@
 # Optional: faster-whisper for Japanese speech-to-text (STT)
 # Falls back to audio-only playback if not installed.
 faster-whisper>=1.0.0
+PyYAML>=6.0

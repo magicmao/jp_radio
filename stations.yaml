@@ -1,0 +1,37 @@
+default_area: tokyo
+nhk_areas:
+  - sapporo
+  - sendai
+  - tokyo
+  - nagoya
+  - osaka
+  - hiroshima
+  - matsuyama
+  - fukuoka
+stations:
+  - id: nhk_r1
+    name: NHK ラジオ第1
+    name_zh: NHK 广播第1（综合·新闻）
+    desc: NHK総合 — ニュース・情報・天気予報
+    url: https://simul.drdi.st.nhk/live/3/joined/master.m3u8
+    logo: NHK1
+    category: NHK
+    area: 全国
+
+  - id: nhk_r2
+    name: NHK ラジオ第2
+    name_zh: NHK 广播第2（教育·外语）
+    desc: NHK第2 — 教育・語学・宗教番組
+    url: https://simul.drdi.st.nhk/live/4/joined/master.m3u8
+    logo: NHK2
+    category: NHK
+    area: 全国
+
+  - id: nhk_fm
+    name: NHK FM
+    name_zh: NHK FM（音乐·文化）
+    desc: NHK FM — 音楽・文化・エンタメ
+    url: https://simul.drdi.st.nhk/live/5/joined/master.m3u8
+    logo: NHKFM
+    category: NHK
+    area: 全国
