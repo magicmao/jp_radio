@@ -15,6 +15,7 @@ import time
 import threading
 import queue
 import io
+import tempfile
 import xml.etree.ElementTree as ET
 import wave
 import numpy as np
@@ -26,9 +27,8 @@ from urllib.error import URLError
 # ──────────────────────────────────────────────
 DEFAULT_AREA = "tokyo"
 ENABLE_STT = True           # False で STT を無効化（起動を速くする）
-WHISPER_MODEL = "medium"    # tiny/small/medium/large-v3   medium が精度と速度のバランス良い
-CHUNK_DURATION = 1.5        # 秒ごとキャプチャ（短くして実時間性を上げる）
-STT_WINDOW_SEC = 6          # 滑動窗口：最近 N 秒の音声を一括認識
+WHISPER_MODEL = "medium"     # tiny≈実時/small≈実時+精度/medium=精度重視(CPU遅い)
+CHUNK_DURATION = 1.0        # 秒ごとキャプチャ（短いほど実時間性↑、精度↓）
 SAMPLE_RATE = 16000
 WHISPER_LANG = "ja"
 
@@ -70,17 +70,20 @@ class AudioSTT:
         self._model = None
         self._thread: threading.Thread | None = None
         self._running = False
-        self._audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=16)
-        self._transcript_queue: queue.Queue[str] = queue.Queue(maxsize=3)
-        # 直近の認識結果（滚动显示，扩大缓冲）
-        self._recent: list[str] = []
+        self._audio_queue: queue.Queue[tuple[float, bytes]] = queue.Queue(maxsize=16)
+        self._transcript_queue: queue.Queue[tuple[float, str]] = queue.Queue(maxsize=3)
+        # 直近の認識結果（滚动显示，扩大缓冲），每项为 (音频录制时间, 文本)
+        self._recent: list[tuple[float, str]] = []
         self._current_partial: str = ""  # 当前正在识别的部分文本
+        self._current_partial_audio_time: float = 0.0  # 对应音频时间戳
         self._prebuf: list[bytes] = []   # model 加载期间暂存音频
         self._lock = threading.Lock()
-        # 滑动窗口音频缓冲（PCM s16le bytes 列表）
-        self._window_buf: list[bytes] = []
-        self._window_total_samples: int = 0
-        self._last_text: str = ""  # 上次识别全文，用于去重
+        # 逐块识别状态
+        self._prev_text: str = ""   # 前一块识别文本（用于 initial_prompt 上下文）
+        self._transcribing = False  # 识别进行中标志
+        self._is_music = False      # 当前为音乐/非语音
+        self._chunk_accum: bytes = b""  # 累积 PCM（攒够 2 块再识别，减少短片段误识别）
+        self._chunk_accum_audio_time: float = 0.0  # 累积块的起始音频时间
         self._load_error: str | None = None
         self._loading = True        # モデル加载中フラグ
         self._loading_msg: str = f"Whisper モデル下载中 ({model_name})..."
@@ -103,21 +106,49 @@ class AudioSTT:
 
     # ── 进度监控线程 ──
     def _dl_progress_worker(self):
-        """后台线程：每 0.3s 扫描 .whisper_models/ 目录计算下载进度。"""
+        """后台线程：每 0.3s 扫描模型目录计算下载进度。"""
         self._dl_start_time = time.monotonic()
-        while self._loading and self._dl_progress < 99.0:
-            try:
-                if self._model_cache and os.path.isdir(self._model_cache):
-                    total = sum(
-                        os.path.getsize(os.path.join(root, f))
-                        for root, _, files in os.walk(self._model_cache)
-                        for f in files
-                    )
-                    self._dl_downloaded = total
-                    self._dl_progress = min(99.0, total / self._model_total_bytes * 100)
-            except Exception:
-                pass
-            time.sleep(0.3)
+        # 记录扫描开始前目录的基线大小（排除已有模型文件的干扰）
+        baseline = 0
+        try:
+            if self._model_cache and os.path.isdir(self._model_cache):
+                baseline = sum(
+                    os.path.getsize(os.path.join(root, f))
+                    for root, _, files in os.walk(self._model_cache)
+                    for f in files
+                )
+        except Exception:
+            pass
+        # 如果基线已 >= 模型大小，说明已缓存，走加载模式而非下载模式
+        is_cached = baseline >= self._model_total_bytes * 0.8
+        if is_cached:
+            self._loading_msg = f"Whisper モデル読込中 ({self.model_name})..."
+            while self._loading and self._dl_progress < 99.0:
+                elapsed = time.monotonic() - self._dl_start_time
+                # 渐近曲线：永远逼近但不到 99%，不会"卡住"
+                # 公式：99 * (1 - e^(-t/8))，8秒时约到63%，16秒约86%，24秒约95%
+                import math
+                pct = 99.0 * (1.0 - math.exp(-elapsed / 8.0))
+                self._dl_progress = pct
+                self._dl_downloaded = int(self._model_total_bytes * pct / 100)
+                self._loading_msg = f"Whisper モデル読込中 ({self.model_name})... {elapsed:.0f}s"
+                time.sleep(0.3)
+        else:
+            # 首次下载：扫描文件增量
+            while self._loading and self._dl_progress < 99.0:
+                try:
+                    if self._model_cache and os.path.isdir(self._model_cache):
+                        total = sum(
+                            os.path.getsize(os.path.join(root, f))
+                            for root, _, files in os.walk(self._model_cache)
+                            for f in files
+                        )
+                        new_bytes = max(0, total - baseline)
+                        self._dl_downloaded = new_bytes
+                        self._dl_progress = min(99.0, new_bytes / self._model_total_bytes * 100)
+                except Exception:
+                    pass
+                time.sleep(0.3)
         self._dl_downloaded = self._model_total_bytes
         self._dl_progress = 100.0
 
@@ -137,6 +168,13 @@ class AudioSTT:
             _os.environ["HF_HUB_CACHE"] = _model_cache
             _os.environ["HF_HOME"] = _model_cache
             _os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+            _os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+            _os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+            # 抑制 HF Hub 的 "unauthenticated requests" 警告
+            import warnings
+            warnings.filterwarnings("ignore", message=".*unauthenticated.*")
+            import logging
+            logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
             self._model_cache = _model_cache
 
             # 启动进度监控线程
@@ -147,25 +185,33 @@ class AudioSTT:
             )
             self._dl_progress_thread.start()
 
-            from faster_whisper import WhisperModel
-
-            self._loading_msg = f"Whisper モデル下载中 ({self.model_name})..."
-
-            # GPU があれば cuda、なければ CPU
+            # 模型加载期间重定向 stderr，防止警告污染 curses TUI
+            _old_stderr = sys.stderr
+            _devnull = open(os.devnull, "w")
+            sys.stderr = _devnull
             try:
-                self._model = WhisperModel(
-                    self.model_name,
-                    device="cuda",
-                    compute_type="float16",
-                )
-                self._loading_msg = "[Whisper] GPU モードで動作中"
-            except Exception:
-                self._model = WhisperModel(
-                    self.model_name,
-                    device="cpu",
-                    compute_type="int8",
-                )
-                self._loading_msg = "[Whisper] CPU モードで動作中"
+                from faster_whisper import WhisperModel
+
+                self._loading_msg = f"Whisper モデル下载中 ({self.model_name})..."
+
+                # GPU があれば cuda、なければ CPU
+                try:
+                    self._model = WhisperModel(
+                        self.model_name,
+                        device="cuda",
+                        compute_type="float16",
+                    )
+                    self._loading_msg = "[Whisper] GPU モードで動作中"
+                except Exception:
+                    self._model = WhisperModel(
+                        self.model_name,
+                        device="cpu",
+                        compute_type="int8",
+                    )
+                    self._loading_msg = "[Whisper] CPU モードで動作中"
+            finally:
+                sys.stderr = _old_stderr
+                _devnull.close()
 
             self._loading = False
             self._dl_progress = 100.0
@@ -193,136 +239,122 @@ class AudioSTT:
                 return w.readframes(w.getnframes())
 
     # ── キューに音声を追加（mpv/ffplay から呼ばれる） ──
-    def feed(self, pcm_chunk: bytes):
+    def feed(self, pcm_chunk: bytes, audio_time: float | None = None):
+        if audio_time is None:
+            audio_time = time.monotonic()
         if not self._running:
             return
         if self._model is not None:
             try:
-                self._audio_queue.put_nowait(pcm_chunk)
+                self._audio_queue.put_nowait((audio_time, pcm_chunk))
             except queue.Full:
-                pass
+                # 队列满（16s积压）才丢弃最旧的
+                try:
+                    self._audio_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self._audio_queue.put_nowait((audio_time, pcm_chunk))
+                except queue.Full:
+                    pass
         else:
-            # model 加载中 → 暂存到 prebuf
-            self._prebuf.append(pcm_chunk)
-            # prebuf 最多保留 60 秒音频（约 60 * 16000 * 2 = 1.92MB）
-            while len(self._prebuf) > 750:   # ~60s @ 8s chunks
-                self._prebuf.pop(0)
+            pass
 
     def _worker(self):
         self._ensure_model()
         if not self._model:
             return
 
-        # model 加载完成后，先处理 prebuf
-        while self._prebuf and self._running:
-            raw = self._prebuf.pop(0)
-            self._ingest_chunk(raw)
+        # model 加载完成后，丢弃 prebuf（旧音频已过时，避免延迟）
+        self._prebuf.clear()
 
         while self._running:
             try:
-                raw = self._audio_queue.get(timeout=2.0)
+                audio_time, raw = self._audio_queue.get(timeout=2.0)
             except queue.Empty:
                 continue
-            self._ingest_chunk(raw)
+            # 解码 WAV → PCM
+            if len(raw) < 44:
+                continue
+            try:
+                with io.BytesIO(raw) as f:
+                    with wave.open(f) as w:
+                        pcm = w.readframes(w.getnframes())
+            except Exception:
+                continue
 
-    def _ingest_chunk(self, raw_wav: bytes):
-        """WAV chunk → PCM 追加到滑动窗口，触发识别。"""
-        if len(raw_wav) < 44:
+            # 累积 PCM 到缓冲，保留起始时间戳
+            if self._chunk_accum_audio_time == 0.0:
+                self._chunk_accum_audio_time = audio_time
+            self._chunk_accum += pcm
+            accum_sec = len(self._chunk_accum) / (SAMPLE_RATE * 2)
+
+            # 每累积 >= 2s 就识别一次（但 chunk 只有 1s，所以每 2 个 chunk 触发）
+            if accum_sec >= 2.0:
+                self._transcribe_pcm(self._chunk_accum, self._chunk_accum_audio_time)
+                self._chunk_accum = b""
+                self._chunk_accum_audio_time = 0.0
+
+    def _transcribe_pcm(self, pcm: bytes, audio_time: float):
+        """PCM bytes + 音频起始时间戳 → 识别。"""
+        if len(pcm) < SAMPLE_RATE * 2 // 4:
             return
+
+        self._transcribing = True
         try:
-            with io.BytesIO(raw_wav) as f:
-                with wave.open(f) as w:
-                    pcm = w.readframes(w.getnframes())
-            n_samples = len(pcm) // 2
-            self._window_buf.append(pcm)
-            self._window_total_samples += n_samples
+            int16_arr = np.frombuffer(pcm, dtype=np.int16)
+            audio = int16_arr.astype(np.float32) / 32768.0
 
-            # 窗口超过 STT_WINDOW_SEC 时裁剪旧数据
-            max_samples = int(STT_WINDOW_SEC * SAMPLE_RATE)
-            while self._window_total_samples > max_samples and len(self._window_buf) > 1:
-                removed = self._window_buf.pop(0)
-                self._window_total_samples -= len(removed) // 2
+            # 用前一块文本作为 initial_prompt 保持上下文连贯
+            prompt = self._prev_text[-100:] if self._prev_text else None
 
-            self._transcribe_window()
-        except Exception:
-            pass
-
-    def _transcribe_window(self):
-        """用滑动窗口内的完整音频做识别。"""
-        if not self._window_buf:
-            return
-        all_pcm = b"".join(self._window_buf)
-        if len(all_pcm) < SAMPLE_RATE * 2 // 4:  # < 0.25s skip
-            return
-
-        int16_arr = np.frombuffer(all_pcm, dtype=np.int16)
-        audio = int16_arr.astype(np.float32) / 32768.0
-
-        try:
             segments, info = self._model.transcribe(
                 audio,
                 language=self.language,
-                beam_size=3,
-                vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=300, speech_pad_ms=200),
+                beam_size=1,
+                best_of=1,
+                vad_filter=False,
+                initial_prompt=prompt,
+                condition_on_previous_text=False,
             )
             text_parts = []
+            high_no_speech = True
             for seg in segments:
                 t = seg.text.strip()
+                if seg.no_speech_prob < 0.7:
+                    high_no_speech = False
                 if t:
                     text_parts.append(t)
 
-            if text_parts:
-                full_text = " ".join(text_parts)
-                if full_text != self._last_text:
-                    new_text = self._extract_new(self._last_text, full_text)
-                    self._last_text = full_text
-                    if new_text:
-                        with self._lock:
-                            self._current_partial = new_text
-                            self._recent.append(new_text)
-                            if len(self._recent) > 50:
-                                self._recent.pop(0)
-                        try:
-                            self._transcript_queue.put_nowait(new_text)
-                        except queue.Full:
-                            pass
-                with self._lock:
-                    self._current_partial = text_parts[-1] if text_parts else ""
-            else:
+            # 音乐/非语音检测
+            if not text_parts or high_no_speech:
+                rms = np.sqrt(np.mean(audio ** 2))
+                if rms > 0.01:
+                    self._is_music = True
+                else:
+                    self._is_music = False
                 with self._lock:
                     self._current_partial = ""
+                return
+
+            self._is_music = False
+            chunk_text = "".join(text_parts)
+            self._prev_text = chunk_text  # 保存给下一块做 prompt
+
+            with self._lock:
+                self._current_partial = chunk_text
+                self._current_partial_audio_time = audio_time
+                self._recent.append((audio_time, chunk_text))
+                if len(self._recent) > 50:
+                    self._recent.pop(0)
+            try:
+                self._transcript_queue.put_nowait((audio_time, chunk_text))
+            except queue.Full:
+                pass
         except Exception:
             pass
-
-    @staticmethod
-    def _extract_new(old: str, new: str) -> str:
-        """从 new 中提取相对 old 的新增尾部。"""
-        if not old:
-            return new
-        old_chars = old.replace(" ", "")
-        new_chars = new.replace(" ", "")
-        best = 0
-        for i in range(1, len(old_chars) + 1):
-            if new_chars.startswith(old_chars[-i:]):
-                best = i
-        if best > 0:
-            suffix = old_chars[-best:]
-            pos = 0
-            matched = 0
-            for ch in new:
-                if ch == " ":
-                    pos += 1
-                    continue
-                if matched < len(suffix) and ch == suffix[matched]:
-                    matched += 1
-                    pos += 1
-                else:
-                    break
-            if matched == len(suffix):
-                result = new[pos:].strip()
-                return result if result else new
-        return new
+        finally:
+            self._transcribing = False
 
     # ── 制御 ──
     def start(self):
@@ -335,28 +367,51 @@ class AudioSTT:
     def stop(self):
         self._running = False
         self._prebuf.clear()
-        self._window_buf.clear()
-        self._window_total_samples = 0
-        self._last_text = ""
+        self._prev_text = ""
+        self._is_music = False
+        self._transcribing = False
+        self._chunk_accum = b""
+        self._chunk_accum_audio_time = 0.0
         if self._thread:
             self._thread.join(timeout=3.0)
             self._thread = None
         with self._lock:
             self._recent.clear()
             self._current_partial = ""
+            self._current_partial_audio_time = 0.0
 
-    def get_recent(self) -> list[str]:
+    def get_recent(self) -> list[tuple[float, str]]:
+        """返回最近识别结果列表，每项 (音频时间戳, 文本)。"""
         with self._lock:
             return list(self._recent)
+
+    def get_recent_texts(self, max_items: int = 4) -> list[str]:
+        """返回最近文本（不含时间戳），用于显示。"""
+        with self._lock:
+            return [text for _, text in self._recent[-max_items:]]
 
     def get_partial(self) -> str:
         """当前正在识别的实时文本。"""
         with self._lock:
             return self._current_partial
 
+    def get_partial_audio_time(self) -> float:
+        """当前实时文本对应的音频时间戳。"""
+        with self._lock:
+            return self._current_partial_audio_time
+
+    def is_music(self) -> bool:
+        """当前是否检测到音乐/非语音。"""
+        return self._is_music
+
     def get_latest(self) -> str:
         with self._lock:
-            return self._recent[-1] if self._recent else ""
+            return self._recent[-1][1] if self._recent else ""
+
+    def get_latest_with_time(self) -> tuple[float, str]:
+        """返回最新字幕 (音频时间, 文本)。"""
+        with self._lock:
+            return self._recent[-1] if self._recent else (0.0, "")
 
     def is_ready(self) -> bool:
         return self._model is not None and self._load_error is None
@@ -488,11 +543,27 @@ class RadioPlayer:
 
         self.proc: subprocess.Popen | None = None
         self.capture_proc: subprocess.Popen | None = None   # ffmpeg キャプチャ
+        self._fifo_path: str | None = None                  # stream-record FIFO
+        self._fifo_dir: str | None = None
         self.current_station: dict | None = None
         self.is_playing = False
         self.is_paused = False
         self.volume = 80
         self._curses_mode = False   # curses 模式下禁止 print
+
+        # ── 音频缓存（用于字幕同步）──
+        # 缓存目录：脚本同级 .audio_cache/
+        self._cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".audio_cache")
+        os.makedirs(self._cache_dir, exist_ok=True)
+        self._cache_index: list[tuple[float, float]] = []  # (block_audio_start_time, block_file_offset)
+        self._cache_wav_path: str | None = None            # 当前缓存的 WAV 文件
+        self._cache_wav: wave.Wave_write | None = None     # 当前打开的 WAV 写入器
+        self._cache_total_bytes: int = 0                   # 已写入字节数
+        self._cache_start_audio_time: float = 0.0          # 当前缓存文件的音频起始时间
+        self._cache_lock = threading.Lock()
+        # 播放开始的墙上时间（用于计算当前音频播放位置）
+        self._play_start_wall_time: float = 0.0
+        self._play_start_audio_offset: float = 0.0        # 播放开始时的音频偏移
 
     # ── mpv の場合は audio-output で Raw PCM を別プロセスに吐出 ──
     def _build_mpv_play_args(self, url: str) -> list[str]:
@@ -508,12 +579,11 @@ class RadioPlayer:
             "--demuxer-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=10",
         ]
 
-    def _build_ffmpeg_stt_args(self, url: str) -> list[str]:
-        """ffmpeg STT capture 参数：HLS → 16kHz mono s16le PCM → stdout。"""
+    def _build_ffmpeg_stt_args(self, source: str) -> list[str]:
+        """ffmpeg STT capture: source → 16kHz mono s16le PCM → stdout。"""
         return [
             "ffmpeg",
-            "-re",
-            "-i", url,
+            "-i", source,
             "-map", "0:a:0",
             "-ar", str(SAMPLE_RATE),
             "-ac", "1",
@@ -534,26 +604,90 @@ class RadioPlayer:
             url,
         ]
 
+    def _init_audio_cache(self, audio_start_time: float):
+        """初始化/重置音频缓存，创建新的 WAV 文件。"""
+        import uuid
+        cache_path = os.path.join(self._cache_dir, f"stream_{uuid.uuid4().hex[:8]}.wav")
+        # 清理旧缓存文件
+        if self._cache_wav:
+            try:
+                self._cache_wav.close()
+            except Exception:
+                pass
+        self._cache_wav_path = cache_path
+        self._cache_wav = wave.open(cache_path, "wb")
+        self._cache_wav.setnchannels(1)
+        self._cache_wav.setsampwidth(2)
+        self._cache_wav.setframerate(SAMPLE_RATE)
+        self._cache_total_bytes = 0
+        self._cache_start_audio_time = audio_start_time
+        self._cache_index.clear()
+        # 重置播放时间基准
+        self._play_start_wall_time = time.monotonic()
+        self._play_start_audio_offset = audio_start_time
+
+    def _write_audio_cache(self, pcm_chunk: bytes, audio_time: float):
+        """写入一段音频到缓存（线程安全）。"""
+        with self._cache_lock:
+            if self._cache_wav is None:
+                return
+            # 记录这个块的起始偏移
+            self._cache_index.append((audio_time, self._cache_total_bytes))
+            self._cache_wav.writeframes(pcm_chunk)
+            self._cache_total_bytes += len(pcm_chunk)
+
+    def _flush_audio_cache(self):
+        """关闭缓存文件。"""
+        with self._cache_lock:
+            if self._cache_wav:
+                try:
+                    self._cache_wav.close()
+                except Exception:
+                    pass
+                self._cache_wav = None
+
+    def get_current_audio_time(self) -> float:
+        """计算当前正在播放的音频时间（wall-clock 推算）。"""
+        if not self.is_playing or self._play_start_wall_time == 0:
+            return 0.0
+        elapsed = time.monotonic() - self._play_start_wall_time
+        # 暂停时停止推算
+        if self.is_paused:
+            return self._play_start_audio_offset
+        return self._play_start_audio_offset + elapsed
+
     def play(self, station: dict):
+        # 先关闭旧缓存
+        self._flush_audio_cache()
+
         self.stop()
         self.current_station = station
 
         try:
             if self.stt and self.backend == "mpv":
-                # 播放：mpv（coreaudio）
-                mpv_args = self._build_mpv_play_args(station["url"])
-                self.proc = subprocess.Popen(
-                    mpv_args,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                # STT capture：ffmpeg 单独读 HLS → 16kHz mono WAV → Whisper
-                ffmpeg_args = self._build_ffmpeg_stt_args(station["url"])
+                # ── FIFO 方式：mpv 播放 + stream-record → FIFO → ffmpeg → STT ──
+                # 同一ストリームデータを使うので字幕と音声が完全同期
+                self._fifo_dir = tempfile.mkdtemp()
+                self._fifo_path = os.path.join(self._fifo_dir, "stream.ts")
+                os.mkfifo(self._fifo_path)
+
+                # 先启动 ffmpeg（读 FIFO，会阻塞直到 mpv 开始写入）
+                ffmpeg_args = self._build_ffmpeg_stt_args(self._fifo_path)
                 self.capture_proc = subprocess.Popen(
                     ffmpeg_args,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
                 )
+
+                # 启动 mpv：播放 + 将流录制到 FIFO
+                mpv_args = self._build_mpv_play_args(station["url"])
+                mpv_args.append(f"--stream-record={self._fifo_path}")
+                self.proc = subprocess.Popen(
+                    mpv_args,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+
                 t = threading.Thread(target=self._pcm_reader, daemon=True)
                 t.start()
 
@@ -579,7 +713,10 @@ class RadioPlayer:
             self.is_playing = False
 
     def _pcm_reader(self):
-        """ffmpeg stdout（s16le PCM）を読み取って Whisper に送る。"""
+        """ffmpeg stdout（s16le PCM）を読み取って Whisper + 缓存发送。"""
+        # 用 time.monotonic() 记录音频流开始时间
+        first_chunk_time = None
+        bytes_written = 0  # 已写入缓存的总字节数（用于推算音频时间）
         try:
             with self.capture_proc.stdout as stdout:
                 chunk_size = int(SAMPLE_RATE * 2 * CHUNK_DURATION)  # 2 bytes/sample
@@ -587,6 +724,21 @@ class RadioPlayer:
                     chunk = stdout.read(chunk_size)
                     if not chunk:
                         break
+                    if first_chunk_time is None:
+                        first_chunk_time = time.monotonic()
+                        # 初始化音频缓存
+                        self._init_audio_cache(0.0)  # 音频起始时间从 0 开始
+                        self._play_start_wall_time = first_chunk_time
+                        self._play_start_audio_offset = 0.0
+
+                    # 推算这段音频的时间（从流起始点算起）
+                    audio_time = bytes_written / (SAMPLE_RATE * 2)
+
+                    # 写入缓存文件
+                    self._write_audio_cache(chunk, audio_time)
+                    bytes_written += len(chunk)
+
+                    # 转换成 WAV 发送 STT
                     wav_buf = io.BytesIO()
                     with wave.open(wav_buf, "wb") as w:
                         w.setnchannels(1)
@@ -594,9 +746,11 @@ class RadioPlayer:
                         w.setframerate(SAMPLE_RATE)
                         w.writeframes(chunk)
                     if self.stt:
-                        self.stt.feed(wav_buf.getvalue())
+                        self.stt.feed(wav_buf.getvalue(), audio_time)
         except Exception:
             pass
+        finally:
+            self._flush_audio_cache()
 
     def stop(self):
         def safe_terminate(p, timeout=2.0):
@@ -617,6 +771,19 @@ class RadioPlayer:
         safe_terminate(self.capture_proc)
         self.proc = None
         self.capture_proc = None
+        # FIFO クリーンアップ
+        if self._fifo_path:
+            try:
+                os.unlink(self._fifo_path)
+            except OSError:
+                pass
+            self._fifo_path = None
+        if self._fifo_dir:
+            try:
+                os.rmdir(self._fifo_dir)
+            except OSError:
+                pass
+            self._fifo_dir = None
         self.is_playing = False
         self.is_paused = False
         self.current_station = None
@@ -632,6 +799,9 @@ class RadioPlayer:
             self.stop()
             if was and self.current_station:
                 self.play(self.current_station)
+        # 暂停/恢复后重新校准播放时间
+        if self.is_playing and not self.is_paused:
+            self._play_start_wall_time = time.monotonic()
 
         state = "一時停止中" if self.is_paused else "再生中"
         if not self._curses_mode:
@@ -666,7 +836,7 @@ def run_curses(stdscr, player: RadioPlayer, all_stations: list, stt: AudioSTT | 
     player._curses_mode = True
     curses.curs_set(0)
     stdscr.nodelay(True)
-    stdscr.timeout(150)
+    stdscr.timeout(80)
 
     curses.start_color()
     curses.use_default_colors()
@@ -853,20 +1023,54 @@ def run_curses(stdscr, player: RadioPlayer, all_stations: list, stt: AudioSTT | 
         else:
             recent = stt.get_recent() if stt else []
             partial = stt.get_partial() if stt else ""
+            # 当前音频播放时间（用于字幕同步）
+            cur_audio_time = player.get_current_audio_time() if player else 0.0
+            # 字幕延迟阈值：音频已播放超过此时间才显示字幕
+            SYNC_DELAY = 0.5  # 秒，音频播放 0.5s 后显示对应字幕
             # 前4行=历史，最后1行=当前实时
             hist_rows = stt_rows - 1
-            display = recent[-hist_rows:] if len(recent) >= hist_rows else recent
             stt_lines = [""] * stt_rows
-            for j, text in enumerate(display):
-                row_idx = hist_rows - len(display) + j
-                if 0 <= row_idx < hist_rows:
-                    stt_lines[row_idx] = text
-            # 最后一行：当前正在识别（闪烁光标）
-            if partial:
+
+            # 从历史中选择"已到时间"的字幕（带延迟同步）
+            # 字幕按时间顺序排列，取最新的几条
+            display_items = []  # 提前初始化，避免 NameError
+            if recent:
+                # 过滤出已到时间的字幕
+                due_captions = [(at, text) for at, text in recent if (cur_audio_time - at) >= SYNC_DELAY]
+                # 取最近 hist_rows 条
+                display_items = due_captions[-hist_rows:] if len(due_captions) >= hist_rows else recent[-hist_rows:]
+                for j, (audio_ts, text) in enumerate(display_items):
+                    row_idx = hist_rows - len(display_items) + j
+                    if 0 <= row_idx < hist_rows:
+                        stt_lines[row_idx] = text
+
+            # 最后一行：当前正在识别（闪烁光标）/ 音乐检测
+            if stt and stt.is_music():
+                music_anim = ["♪", "♫", "♪♫", "♫♪"]
+                sym = music_anim[(stt_anim_frame // 4) % len(music_anim)]
+                # 显示当前音频时间和字幕延迟差
+                if recent and cur_audio_time > 0:
+                    last_audio_ts, _ = recent[-1]
+                    lag = cur_audio_time - last_audio_ts
+                    lag_str = f" [{lag:.1f}s behind]"
+                else:
+                    lag_str = ""
+                stt_lines[stt_rows - 1] = f"  {sym} 【MUSIC...】{sym}{lag_str}"
+            elif partial:
+                # 实时字幕显示，带延迟指示
                 blink = "▍" if (stt_anim_frame // 3) % 2 == 0 else " "
-                stt_lines[stt_rows - 1] = f"▸ {partial}{blink}"
-            elif recent:
+                # 如果有上条字幕的时间，计算延迟
+                if recent and cur_audio_time > 0:
+                    last_audio_ts, last_text = recent[-1]
+                    lag = cur_audio_time - last_audio_ts
+                    lag_str = f" [{lag:.1f}s behind]" if lag > 0.1 else ""
+                else:
+                    lag_str = ""
+                stt_lines[stt_rows - 1] = f"▸ {partial}{blink}{lag_str}"
+            elif display_items:
                 stt_lines[stt_rows - 1] = "▸ ..."
+            else:
+                stt_lines[stt_rows - 1] = ""
 
         for i, line in enumerate(stt_lines):
             y = stt_sep_y + 1 + i
@@ -960,7 +1164,7 @@ def run_curses(stdscr, player: RadioPlayer, all_stations: list, stt: AudioSTT | 
                 pass
             player.is_playing = False
 
-        time.sleep(0.05)
+        time.sleep(0.02)
 
 
 def run_simple(player: RadioPlayer, all_stations: list, stt: AudioSTT | None):
